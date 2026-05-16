@@ -74,7 +74,7 @@
         "description": "排行榜最多显示的行数。"
     },
     "remote_resource_url_base": {
-        "description": "远程资源服务器的根 URL",
+        "description": "远程资源服务器的URL",
         "type": "string",
         "default": "https://storage.exmeaning.com/sekai-jp-assets",
         "hint": "插件将从此 URL 下载音频和图片资源。URL末尾不需要加'/'。"
