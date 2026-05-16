@@ -348,15 +348,6 @@ class AudioService:
                 g = int(bg_color_start[1] + (bg_color_end[1] - bg_color_start[1]) * y / height)
                 b = int(bg_color_start[2] + (bg_color_end[2] - bg_color_start[2]) * y / height)
                 draw_bg.line([(0, y), (width, y)], fill=(r, g, b))
-            background_path = self.resources_dir / "ranking_bg.png"
-            if background_path.exists():
-                try:
-                    custom_bg = Image.open(background_path).convert("RGBA").resize((width, height), LANCZOS)
-                    custom_bg.putalpha(128)
-                    img = img.convert("RGBA")
-                    img = Image.alpha_composite(img, custom_bg)
-                except Exception as e:
-                    logger.warning(f"加载或混合自定义背景图片失败: {e}")
             if img.mode != 'RGBA': img = img.convert('RGBA')
             white_overlay = Image.new("RGBA", img.size, (255, 255, 255, 100))
             img = Image.alpha_composite(img, white_overlay)
@@ -535,13 +526,7 @@ class AudioService:
         try:
             width, height = 1000, 1200
 
-            background_path = self.resources_dir / "ranking_bg.png"
-            if background_path.exists():
-                img = Image.open(background_path).convert("RGBA")
-                if img.size != (width, height):
-                    img = img.resize((width, height), LANCZOS)
-            else:
-                img = Image.new("RGBA", (width, height), (230, 240, 255)).convert("RGBA")
+            img = Image.new("RGBA", (width, height), (230, 240, 255)).convert("RGBA")
 
             white_overlay = Image.new("RGBA", img.size, (255, 255, 255, 185))
             img = Image.alpha_composite(img, white_overlay)
