@@ -706,13 +706,11 @@ class GuessSongPlugin(Star):
                 )
                 await event.send(event.chain_result([Comp.Plain(auto_intro)]))
             elif is_official_round and official_self_id:
-                # 官方机器人以 markdown 发送开局消息，附"仅退出本局 / 退出自动模式"连接
+                # 官方机器人以 markdown 发送开局消息，附"仅退出本局"连接
                 # （回答仍监听会话内全部消息，无需点击回答）
                 intro_md = intro_text + (
                     "\n"
                     + self._build_connect_link("仅退出本局", official_self_id)
-                    + "  "
-                    + self._build_connect_link("退出自动模式", official_self_id)
                 )
                 await self._send_markdown_text(event, intro_md)
             else:
