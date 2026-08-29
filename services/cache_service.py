@@ -19,7 +19,15 @@ class CacheService:
 
         os.makedirs(self.output_dir, exist_ok=True)
 
-        self.remote_resource_url_base = self.config.get("remote_resource_url_base", "https://storage.exmeaning.com/sekai-jp-assets").strip('/')
+        # 保留旧 remote_resource_url_base 作为日服配置迁移兜底。
+        self.jp_resource_url_base = str(
+            self.config.get("jp_resource_url_base", self.config.get("remote_resource_url_base", "https://storage.exmeaning.com/sekai-jp-assets"))
+            or "https://storage.exmeaning.com/sekai-jp-assets"
+        ).strip("/")
+        self.sc_resource_url_base = str(
+            self.config.get("sc_resource_url_base", "https://storage.exmeaning.com/sekai-sc-assets")
+            or "https://storage.exmeaning.com/sekai-sc-assets"
+        ).strip("/")
 
         self.song_data: List[Dict] = []
 
@@ -57,14 +65,15 @@ class CacheService:
                     os.remove(file_path)
                     logger.info(f"已清理旧的输出文件: {filename}")
 
-    def get_resource_url(self, relative_path: str) -> Optional[str]:
-        if not self.remote_resource_url_base:
-            logger.error("远程资源服务器地址未设置 (remote_resource_url_base)。")
+    def get_resource_url(self, relative_path: str, server: str = "jp") -> Optional[str]:
+        base_url = self.sc_resource_url_base if server == "sc" else self.jp_resource_url_base
+        if not base_url:
+            logger.error("远程资源服务器地址未设置。")
             return None
-        return f"{self.remote_resource_url_base}/{'/'.join(Path(relative_path).parts)}"
+        return f"{base_url}/{'/'.join(Path(relative_path).parts)}"
 
-    async def open_image(self, relative_path: str) -> Optional[Image.Image]:
-        url = self.get_resource_url(relative_path)
+    async def open_image(self, relative_path: str, server: str = "jp") -> Optional[Image.Image]:
+        url = self.get_resource_url(relative_path, server)
         if not url: return None
 
         try:

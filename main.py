@@ -95,7 +95,6 @@ DEFAULT_CONNECT_TEMPLATE = '<qqbot-cmd-input text="{encoded_command}" show="{enc
 _LEGACY_TEMPLATE_MARKERS = ("{encoded_at_text}", "mqqapi://")
 
 # 快捷入口：所有 PJSK 娱乐插件的触发指令，Wordle 固定排最后
-_QUICK_ENTRIES = ["猜歌", "猜曲绘", "猜卡面", "歌词猜曲", "Wordle"]
 
 
 class BindingSessionFilter(SessionFilter):
@@ -239,6 +238,17 @@ class GuessSongPlugin(Star):
         result.use_markdown(True)
         await event.send(result)
 
+    def _get_quick_entries(self) -> list[str]:
+        """读取快捷入口配置；若列表为空则不显示快捷入口。"""
+        entries = self.config.get("quick_entries")
+        if not entries:
+            return []
+        cleaned = [str(x).strip() for x in entries if str(x).strip()]
+        wordle = "Wordle"
+        if wordle in cleaned:
+            cleaned = [x for x in cleaned if x != wordle] + [wordle]
+        return cleaned
+
     def _build_server_footer(self, event: AstrMessageEvent, server: str) -> List[str]:
         """构建结算消息的题库服务器尾部：官机附 markdown 连接入口与快捷入口，普通 QQ 仅提示指令。"""
         other = SERVER_SC if server == SERVER_JP else SERVER_JP
@@ -254,10 +264,11 @@ class GuessSongPlugin(Star):
                 lines.append(
                     "  ".join(self._build_connect_link(name, self_id) for name in account_links)
                 )
-                if _QUICK_ENTRIES:
+                entries = self._get_quick_entries()
+                if entries:
                     lines.append("快捷入口：")
                     lines.append(
-                        "  ".join(self._build_connect_link(name, self_id) for name in _QUICK_ENTRIES)
+                        "  ".join(self._build_connect_link(name, self_id) for name in entries)
                     )
                 return lines
         lines.append(f"你可以使用{switch_cmd}指令切换{SERVER_LABELS[other]}题库。")
@@ -486,6 +497,7 @@ class GuessSongPlugin(Star):
                 await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
                 return
             game_kwargs['force_song_object'] = random.choice(song_pool)
+            game_kwargs['server'] = self._server_for_session(session_id)
             game_data = await self.audio_service.get_game_clip(**game_kwargs)
             if not game_data:
                 await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
@@ -545,6 +557,7 @@ class GuessSongPlugin(Star):
                 await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
                 return
             combined_kwargs['force_song_object'] = random.choice(song_pool)
+            combined_kwargs['server'] = self._server_for_session(session_id)
             game_data = await self.audio_service.get_game_clip(**combined_kwargs)
             if not game_data:
                 await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
@@ -615,6 +628,7 @@ class GuessSongPlugin(Star):
                     await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
                     return
                 combined_kwargs['force_song_object'] = random.choice(song_pool)
+                combined_kwargs['server'] = self._server_for_session(session_id)
                 game_data = await self.audio_service.get_game_clip(**combined_kwargs)
             else:
                 await self.stats_service.api_ping("guess_song")
@@ -636,6 +650,7 @@ class GuessSongPlugin(Star):
                     await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
                     return
                 game_kwargs['force_song_object'] = random.choice(song_pool)
+                game_kwargs['server'] = self._server_for_session(session_id)
                 game_data = await self.audio_service.get_game_clip(**game_kwargs)
 
             if not game_data:
@@ -687,7 +702,7 @@ class GuessSongPlugin(Star):
                 # 自动模式：不出现 markdown 按钮，用文字提示退出方式
                 auto_intro = (
                     intro_text
-                    + "\n发送「仅退出本局」可结束本局，发送「退出自动模式」可停止自动模式。"
+                    + "\n发送「退出」可结束自动模式，发送「退出本局」可提前结束这一局。"
                 )
                 await event.send(event.chain_result([Comp.Plain(auto_intro)]))
             elif is_official_round and official_self_id:
@@ -701,7 +716,9 @@ class GuessSongPlugin(Star):
                 )
                 await self._send_markdown_text(event, intro_md)
             else:
-                await event.send(event.chain_result([Comp.Plain(intro_text)]))
+                # 普通模式（非官机）：提示「退出本局」指令可提前结束这一局
+                plain_intro = intro_text + "\n发送「退出本局」可提前结束这一局。"
+                await event.send(event.chain_result([Comp.Plain(plain_intro)]))
             if intro_image_path:
                 await event.send(event.chain_result([Comp.Image(file=intro_image_path)]))
 
@@ -730,7 +747,7 @@ class GuessSongPlugin(Star):
             answer_text = answer_event.message_str.strip()
 
             # 仅退出本局：只在游玩时生效，立即结束当前对局（不影响自动模式）
-            if answer_text == "仅退出本局":
+            if answer_text in ["仅退出本局", "退出本局"]:
                 quit_ended_round = True
                 controller.stop()
                 return
@@ -875,12 +892,14 @@ class GuessSongPlugin(Star):
 
         logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
 
-        options_img_path = await self.audio_service.create_options_image(options)
+        server = self._server_for_session(session_id)
+        game_data["server"] = server
+        options_img_path = await self.audio_service.create_options_image(options, server)
 
         answer_timeout = self._get_setting_for_group(event, "answer_timeout", 30)
         intro_text = f"嗯...\n这首歌是什么呢？请在{answer_timeout}秒内发送编号回答哦～\n每个玩家有2次作答机会"
 
-        jacket_source = self.cache_service.get_resource_url(f"music/jacket/{correct_song['jacketAssetbundleName']}/{correct_song['jacketAssetbundleName']}.png")
+        jacket_source = self.cache_service.get_resource_url(f"music/jacket/{correct_song['jacketAssetbundleName']}/{correct_song['jacketAssetbundleName']}.png", server)
         answer_reveal_messages = [
             Comp.Plain(f"正确答案是:\n{game_data['correct_answer_num']}. {correct_song.get('cn', correct_song['title'])}\n"),
         ]
@@ -982,6 +1001,7 @@ class GuessSongPlugin(Star):
                     await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
                     return
                 combined_kwargs['force_song_object'] = random.choice(song_pool)
+                combined_kwargs['server'] = self._server_for_session(session_id)
                 game_data = await self.audio_service.get_game_clip(**combined_kwargs)
             else:
                 await self.stats_service.api_ping("guess_song")
@@ -1002,6 +1022,7 @@ class GuessSongPlugin(Star):
                     await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
                     return
                 game_kwargs['force_song_object'] = random.choice(song_pool)
+                game_kwargs['server'] = self._server_for_session(session_id)
                 game_data = await self.audio_service.get_game_clip(**game_kwargs)
 
             if not game_data:

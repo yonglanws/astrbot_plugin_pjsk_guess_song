@@ -10,7 +10,7 @@
 - 🔄 **题库自动同步**：歌曲题库自 Haruki master（`musics.json` + `musicVocals.json`）+ 中文翻译每 24 小时自动同步，新歌随游戏版本更新自动入库，版本未变跳过大文件下载
 - 🌐 **多服务器题库**：支持日服 / 国服题库自由切换，按群独立记忆
 - 🏆 **精美数据面板**：内置积分排行榜（Pillow 本地渲染横向表格，与猜卡面同款视觉规范，支持自定义名称、未绑定 QQ 徽章）、个人战绩查询、每日次数限制与冷却
-- 🤖 **QQ 官方机器人支持**：官机 markdown 渲染，开局附操作连接，结算附切换题库/绑定/查分/排行榜连接与快捷入口；支持绑定普通 QQ 迁移分数
+- 🤖 **QQ 官方机器人支持**：官机 markdown 渲染，开局附操作连接，结算附切换题库/绑定/查分/排行榜连接；快捷入口由 `quick_entries` 配置控制（默认关闭）；支持绑定普通 QQ 迁移分数
 - ⚡ **双模式退出**：`仅退出本局` 与 `退出自动模式` 严格分离，自动模式精简无扰
 - ⚙️ **分群独立配置**：支持通过 `group_settings.json` 设置群专属禁用时段、独立每日次数等高级策略
 
@@ -76,6 +76,7 @@
 | `default_server` | string | `jp` | 默认题库服务器（`jp`=日服 / `sc`=国服） |
 | `update_interval_hours` | int | `24` | master 题库自动更新间隔（小时） |
 | `connect_link_template` | string | （官方标签） | QQ 官方机器人结算连接的 markdown 模板 |
+| `quick_entries` | list | `[]` | 结算快捷入口列表（若为空则不显示快捷入口） |
 | `answer_timeout` | int | `30` | 答题超时时间（秒） |
 | `daily_play_limit` | int | `15` | 每日游戏次数上限 |
 | `game_cooldown_seconds` | int | `60` | 游戏冷却时间（秒） |
@@ -84,7 +85,9 @@
 | `bonus_time_after_first_answer` | int | `5` | 首位答对后的奖励有效时间（秒，0 为禁用） |
 | `end_game_after_bonus_time` | bool | `true` | 是否在奖励时间结束后立即结束游戏 |
 | `ranking_row_limit` | int | `10` | 排行榜显示人数 |
-| `remote_resource_url_base` | string | `https://storage.exmeaning.com/sekai-jp-assets` | 远程音频/封面资源根地址 |
+| `jp_resource_url_base` | string | `https://storage.exmeaning.com/sekai-jp-assets` | 日服音频/封面资源根地址 |
+| `sc_resource_url_base` | string | `https://storage.exmeaning.com/sekai-sc-assets` | 国服音频/封面资源根地址 |
+| `remote_resource_url_base` | string | （兼容旧配置） | 旧版日服资源地址迁移兜底，不建议新配置使用 |
 | `stats_server_api_key` | string | `""` | 统计服务器 API 密钥（留空禁用在线同步） |
 | `debug_mode` | bool | `false` | 调试模式（立即显示答案） |
 | `group_whitelist` | list | `[]` | 群聊白名单（为空则所有群可用） |
@@ -112,7 +115,8 @@
 - 日服master：[Team-Haruki/haruki-sekai-master](https://github.com/Team-Haruki/haruki-sekai-master)
 - 国服master：[Team-Haruki/haruki-sekai-sc-master](https://github.com/Team-Haruki/haruki-sekai-sc-master)
 - 中文译名：`translation.exmeaning.com`（Moesekai 翻译源）
-- 音频与封面资源：`storage.exmeaning.com/sekai-jp-assets`
+- 日服音频与封面资源：`https://storage.exmeaning.com/sekai-jp-assets`
+- 国服音频与封面资源：`https://storage.exmeaning.com/sekai-sc-assets`
 
 优先走 GitHub Contents API，失败时回退 jsDelivr CDN。数据持久化于 `data/plugin_data/pjsk_guess_song/`。
 

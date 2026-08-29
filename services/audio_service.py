@@ -81,6 +81,7 @@ class AudioService:
         loop = asyncio.get_running_loop()
 
         song = kwargs.get("force_song_object")
+        server = kwargs.get("server", "jp")
         audio_source = None
 
         if not song:
@@ -95,7 +96,7 @@ class AudioService:
 
         if vocal_version:
             bundle_name = vocal_version["vocalAssetbundleName"]
-            audio_source = self.cache_service.get_resource_url(f"music/long/{bundle_name}/{bundle_name}.mp3")
+            audio_source = self.cache_service.get_resource_url(f"music/long/{bundle_name}/{bundle_name}.mp3", server)
 
         if not audio_source:
             logger.error(f"歌曲 '{song.get('title')}' 没有有效的音频源文件。")
@@ -187,9 +188,9 @@ class AudioService:
             logger.error(f"Pydub processing in executor failed: {e}", exc_info=True)
             return None
 
-    async def create_options_image(self, options: List[Dict]) -> Optional[str]:
+    async def create_options_image(self, options: List[Dict], server: str = "jp") -> Optional[str]:
         if not options or len(options) != 12: return None
-        tasks = [self.cache_service.open_image(f"music/jacket/{opt['jacketAssetbundleName']}/{opt['jacketAssetbundleName']}.png") for opt in options]
+        tasks = [self.cache_service.open_image(f"music/jacket/{opt['jacketAssetbundleName']}/{opt['jacketAssetbundleName']}.png", server) for opt in options]
         jacket_images = await asyncio.gather(*tasks)
         loop = asyncio.get_running_loop()
         try:

@@ -1,6 +1,7 @@
 # 更新日志
 
 ### v1.2.0
+- **双服资源路由**：音频、选项封面与答案曲绘随当前题库服务器自动切换：日服使用 `https://storage.exmeaning.com/sekai-jp-assets`，国服使用 `https://storage.exmeaning.com/sekai-sc-assets`；新增 `jp_resource_url_base` / `sc_resource_url_base` 配置项（旧 `remote_resource_url_base` 保留作日服兼容兜底）
 
 - **题库 master 数据自动同步**：歌曲题库改从 Haruki master 数据（`musics.json` + `musicVocals.json`）自动拉取，每 24 小时检查一次，新歌随游戏版本更新自动入库；中文歌名来自 Moesekai 同款翻译源；GitHub API 不可用时回退 jsDelivr，dataVersion 未变化时跳过大文件下载
 - **新增日服/国服题库切换**：`猜歌切换日服题库` / `猜歌切换国服题库`，按群独立记忆，结算显示当前题库服务器
