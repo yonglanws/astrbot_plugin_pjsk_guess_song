@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
+from urllib.parse import quote
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
@@ -15,10 +16,19 @@ from astrbot.core.utils.session_waiter import session_waiter, SessionController,
 from astrbot.api import AstrBotConfig
 
 # 导入重构后的服务
-from .services.db_service import DBService
-from .services.audio_service import AudioService
-from .services.stats_service import StatsService
-from .services.cache_service import CacheService
+try:
+    from .services.db_service import DBService
+    from .services.audio_service import AudioService
+    from .services.stats_service import StatsService
+    from .services.cache_service import CacheService
+    from .services.master_data_service import SERVER_JP, SERVER_SC, MasterDataService
+except ImportError:  # 直接以脚本方式加载（单测）时使用绝对导入
+    from services.db_service import DBService
+    from services.audio_service import AudioService
+    from services.stats_service import StatsService
+    from services.cache_service import CacheService
+    from services.master_data_service import SERVER_JP, SERVER_SC, MasterDataService
+
 
 def _get_normalized_session_id(event: AstrMessageEvent) -> str:
     """
@@ -60,8 +70,48 @@ class CustomSessionFilter(SessionFilter):
 PLUGIN_NAME = "pjsk_guess_song"
 PLUGIN_AUTHOR = "nichinichisou"
 PLUGIN_DESCRIPTION = "PJSK猜歌插件"
-PLUGIN_VERSION = "1.1.3"
+PLUGIN_VERSION = "1.2.0"
 PLUGIN_REPO_URL = "https://github.com/nichinichisou0609/astrbot_plugin_pjsk_guess_song"
+DEFAULT_PLATFORM_NAME = "aiocqhttp"
+OFFICIAL_PLATFORM_NAME = "qq_official"
+OFFICIAL_QID_PATTERN = re.compile(r"^[0-9a-fA-F]{32}$")
+
+# --- 题库服务器与官机 markdown 机制（与 PJSK Wordle 保持一致） ---
+SERVER_JP = "jp"
+SERVER_SC = "sc"
+SERVER_LABELS = {SERVER_JP: "日服", SERVER_SC: "国服"}
+SERVER_BADGES = {SERVER_JP: "日服题库", SERVER_SC: "国服题库"}
+# 结算尾部显示的切换指令（当前日服 → 提示切换国服）
+SWITCH_COMMANDS = {SERVER_JP: "猜歌切换国服题库", SERVER_SC: "猜歌切换日服题库"}
+# 结算连接入口使用的指令名（与注册指令别名一一对应）
+CONNECT_SWITCH_COMMANDS = {SERVER_JP: "猜歌切换国服题库", SERVER_SC: "猜歌切换日服题库"}
+
+# 指令连接的默认 markdown 模板：QQ 官方机器人 markdown 消息的参数指令标签
+# （见 bot.q.qq.com/wiki 的 markdown / text-chain 文档）。
+# text 只放指令本身：QQ 客户端在群聊发送时会自动 @ 官方机器人，
+# 拼进 "@id" 反而会出现双重 @。
+DEFAULT_CONNECT_TEMPLATE = '<qqbot-cmd-input text="{encoded_command}" show="{encoded_name}" />'
+# 旧版本默认模板特征：命中即视为未自定义，自动升级到新默认模板
+_LEGACY_TEMPLATE_MARKERS = ("{encoded_at_text}", "mqqapi://")
+
+# 快捷入口：所有 PJSK 娱乐插件的触发指令，Wordle 固定排最后
+_QUICK_ENTRIES = ["猜歌", "猜曲绘", "猜卡面", "歌词猜曲", "Wordle"]
+
+
+class BindingSessionFilter(SessionFilter):
+    """只接收发起绑定的同一用户在同一会话中的确认消息。"""
+
+    def __init__(self, session_id: str, user_id: str):
+        self.session_id = str(session_id)
+        self.user_id = str(user_id)
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        if (
+            str(event.unified_msg_origin) != self.session_id
+            or str(event.get_sender_id()) != self.user_id
+        ):
+            return ""
+        return f"{event.unified_msg_origin}:{event.get_sender_id()}"
 
 
 @register(PLUGIN_NAME, PLUGIN_AUTHOR, PLUGIN_DESCRIPTION, PLUGIN_VERSION, PLUGIN_REPO_URL)
@@ -89,14 +139,176 @@ class GuessSongPlugin(Star):
         self.context.game_session_locks = getattr(self.context, "game_session_locks", {})
         self.context.active_game_sessions = getattr(self.context, "active_game_sessions", set())
         self.last_game_end_time = {}
+        self.auto_game_sessions = {}  # session_id -> mode_key
+        self.consecutive_no_answer = {}  # session_id -> int (连续无人回答的局数)
+
+        # 内置静态曲池（master 题库未就绪时的回退数据源，_async_init 中加载）
+        self.song_data: List[Dict] = []
+
+        # --- 题库服务器偏好与 master 数据自动同步 ---
+        self.server_prefs_path = data_dir / "session_servers.json"
+        self.server_prefs: Dict = self._load_server_prefs()
+        self.master_data = MasterDataService(
+            data_dir,
+            update_interval_hours=int(config.get("update_interval_hours", 24)),
+        )
+        self.master_data.on_songs_updated = self._on_master_updated
 
         self.game_effects = self.audio_service.game_effects
         self.game_modes = self.audio_service.game_modes
         self.mode_name_map = self.audio_service.mode_name_map
-        
+
         # 异步初始化任务
         self._init_task = asyncio.create_task(self._async_init())
+        self._master_task = asyncio.create_task(self.master_data.start())
         self._cleanup_task = asyncio.create_task(self.cache_service.periodic_cleanup_task())
+
+    # --- 题库服务器与 master 数据同步 ---
+
+    def _load_server_prefs(self) -> Dict:
+        try:
+            if self.server_prefs_path.exists():
+                return json.loads(self.server_prefs_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"加载题库服务器偏好失败: {e}")
+        return {}
+
+    def _save_server_prefs(self):
+        try:
+            self.server_prefs_path.write_text(
+                json.dumps(self.server_prefs, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning(f"保存题库服务器偏好失败: {e}")
+
+    def _server_for_session(self, session_id: str) -> str:
+        saved = self.server_prefs.get(session_id)
+        if saved in (SERVER_JP, SERVER_SC):
+            return saved
+        default = str(self.config.get("default_server", SERVER_JP)).lower()
+        return SERVER_SC if default == SERVER_SC else SERVER_JP
+
+    def _on_master_updated(self):
+        """题库更新后的回调（曲池在开局时按会话实时读取，无需额外重建）。"""
+        logger.info("[猜歌插件] 题库已随 master 数据更新。")
+
+    def _get_song_pool(self, session_id: str) -> List[Dict]:
+        """获取会话当前服务器的曲池；master 题库未就绪时回退内置曲池。"""
+        server = self._server_for_session(session_id)
+        master_songs = self.master_data.get_songs(server)
+        if master_songs:
+            return master_songs
+        return self.song_data or []
+
+    # --- 官机 markdown 机制（与 PJSK Wordle 一致） ---
+
+    def _build_connect_link(self, command: str, self_id: str, show: Optional[str] = None) -> str:
+        """按配置模板生成 markdown 格式的指令连接。
+
+        默认使用 QQ 官方机器人 markdown 消息的参数指令标签
+        <qqbot-cmd-input>：点击后在聊天框填入指令，QQ 客户端发送时会自动 @ 官方机器人。
+        show 为展示名（默认与指令一致）。可通过 connect_link_template 配置项适配环境，
+        模板显式置空则退回纯文本"（连接：@官机 指令）"。
+        """
+        template = self.config.get("connect_link_template")
+        if template is None or any(marker in str(template) for marker in _LEGACY_TEMPLATE_MARKERS):
+            template = DEFAULT_CONNECT_TEMPLATE
+        template = str(template).strip()
+        if not template:
+            return f"（连接：@{self_id} {command}）"
+        display = show or command
+        at_text = f"@{self_id} {command}"
+        return template.format(
+            name=command,
+            command=command,
+            self_id=self_id,
+            at_text=at_text,
+            encoded_command=quote(command, safe=""),
+            encoded_name=quote(display, safe=""),
+            encoded_at_text=quote(at_text, safe=""),
+        )
+
+    def _get_official_self_id(self, event: AstrMessageEvent) -> str:
+        return str(getattr(event.message_obj, "self_id", "") or "").strip()
+
+    async def _send_markdown_text(self, event: AstrMessageEvent, text: str):
+        """以 QQ 官方机器人 markdown 消息发送纯文本（含连接标签）。"""
+        result = event.make_result()
+        result.chain = [Comp.Plain(text)]
+        result.use_markdown(True)
+        await event.send(result)
+
+    def _build_server_footer(self, event: AstrMessageEvent, server: str) -> List[str]:
+        """构建结算消息的题库服务器尾部：官机附 markdown 连接入口与快捷入口，普通 QQ 仅提示指令。"""
+        other = SERVER_SC if server == SERVER_JP else SERVER_JP
+        switch_cmd = SWITCH_COMMANDS[server]
+        connect_switch_cmd = CONNECT_SWITCH_COMMANDS[server]
+        lines = [f"本局题库服务器：{SERVER_LABELS[server]}"]
+
+        if self._get_event_platform_name(event) == OFFICIAL_PLATFORM_NAME:
+            self_id = self._get_official_self_id(event)
+            if self_id:
+                lines.append(self._build_connect_link(connect_switch_cmd, self_id))
+                account_links = ["猜歌绑定QQ", "猜歌个人分数", "猜歌排行榜"]
+                lines.append(
+                    "  ".join(self._build_connect_link(name, self_id) for name in account_links)
+                )
+                if _QUICK_ENTRIES:
+                    lines.append("快捷入口：")
+                    lines.append(
+                        "  ".join(self._build_connect_link(name, self_id) for name in _QUICK_ENTRIES)
+                    )
+                return lines
+        lines.append(f"你可以使用{switch_cmd}指令切换{SERVER_LABELS[other]}题库。")
+        return lines
+
+    async def _switch_server(self, event: AstrMessageEvent, server: str):
+        """切换当前会话的题库服务器。"""
+        session_id = _get_normalized_session_id(event)
+        if session_id in self.context.active_game_sessions:
+            await event.send(event.plain_result("本局游戏还在进行中，结束后再切换题库服务器吧。"))
+            return
+        current = self._server_for_session(session_id)
+        if current == server:
+            await event.send(event.plain_result(f"当前题库已经是{SERVER_LABELS[server]}题库了。"))
+            return
+        self.server_prefs[session_id] = server
+        self._save_server_prefs()
+        count = self.master_data.get_song_count(server)
+        version = self.master_data.get_version(server)
+        await event.send(
+            event.plain_result(
+                f"已切换为{SERVER_BADGES[server]}（共 {count} 首，版本 {version}），下一局生效。"
+            )
+        )
+
+    @staticmethod
+    def _get_event_platform_name(event: AstrMessageEvent) -> str:
+        getter = getattr(event, "get_platform_name", None)
+        try:
+            platform_name = getter() if callable(getter) else DEFAULT_PLATFORM_NAME
+        except Exception:
+            platform_name = DEFAULT_PLATFORM_NAME
+        return str(platform_name or DEFAULT_PLATFORM_NAME).strip().lower()
+
+    def _is_qq_official_event(self, event: AstrMessageEvent) -> bool:
+        return self._get_event_platform_name(event) == OFFICIAL_PLATFORM_NAME
+
+    async def _get_account_identity(self, event: AstrMessageEvent) -> Tuple[str, str]:
+        platform_name = self._get_event_platform_name(event)
+        raw_user_id = str(event.get_sender_id())
+        resolved_user_id = await self.db_service.resolve_user_id(platform_name, raw_user_id)
+        if str(resolved_user_id) != raw_user_id:
+            return str(resolved_user_id), DEFAULT_PLATFORM_NAME
+        return raw_user_id, platform_name
+
+    @staticmethod
+    def _build_binding_confirmation_message(qq_user_id: str) -> str:
+        return (
+            f"你确认将账号绑定至  {qq_user_id} ？官方机作答的分数将迁移至该账号。\n"
+            "发送“确认”将开始绑定。发送“取消”将取消绑定。"
+        )
 
     def _load_group_settings(self) -> Dict:
         """从 group_settings.json 加载群聊特定设置。"""
@@ -165,7 +377,14 @@ class GuessSongPlugin(Star):
         if session_id in self.context.active_game_sessions:
             return False, "嗯...有一个正在进行的游戏了呢。"
 
-        can_play = await self.db_service.can_play(event.get_sender_id(), limit, session_id, is_independent_limit)
+        user_id, platform_name = await self._get_account_identity(event)
+        can_play = await self.db_service.can_play(
+            user_id,
+            limit,
+            session_id,
+            is_independent_limit,
+            platform_name,
+        )
         if not debug_mode and not can_play:
             limit_type = "本群" if is_independent_limit else "你"
             return False, f"......{limit_type}今天的游戏次数已达上限（{limit}次），请明天再来吧......"
@@ -234,10 +453,16 @@ class GuessSongPlugin(Star):
             self.context.active_game_sessions.add(session_id)
 
         try:
-            initiator_id = event.get_sender_id()
+            initiator_id, initiator_platform = await self._get_account_identity(event)
             initiator_name = event.get_sender_name()
             is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
-            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name, session_id, is_independent_limit)
+            await self.db_service.consume_daily_play_attempt(
+                initiator_id,
+                initiator_name,
+                session_id,
+                is_independent_limit,
+                initiator_platform,
+            )
             await self.stats_service.api_ping("guess_song")
             
             mode_config = self.game_modes.get(mode_key)
@@ -256,43 +481,16 @@ class GuessSongPlugin(Star):
                 game_type_suffix = 'normal'
             game_kwargs['game_type'] = f"guess_song_{game_type_suffix}"
             
+            song_pool = self._get_song_pool(session_id)
+            if not song_pool:
+                await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
+                return
+            game_kwargs['force_song_object'] = random.choice(song_pool)
             game_data = await self.audio_service.get_game_clip(**game_kwargs)
             if not game_data:
                 await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
                 return
-                
-            correct_song = game_data['song']
-            if not self.song_data:
-                await event.send(event.plain_result("......歌曲数据未加载，无法生成选项。"))
-                return
-
-            other_songs = random.sample([s for s in self.song_data if s['id'] != correct_song['id']], 11)
-            options = [correct_song] + other_songs
-            random.shuffle(options)
-            
-            game_data['options'] = options
-            game_data['correct_answer_num'] = options.index(correct_song) + 1
-            
-            logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
-            
-            options_img_path = await self.audio_service.create_options_image(options)
-            
-            answer_timeout = self._get_setting_for_group(event, "answer_timeout", 30)
-            intro_text = f"嗯...\n这首歌是什么呢？请在{answer_timeout}秒内发送编号回答哦～\n每个玩家有2次作答机会"
-            intro_messages = [Comp.Plain(intro_text)]
-            if options_img_path:
-                intro_messages.append(Comp.Image(file=options_img_path))
-            
-            jacket_source = self.cache_service.get_resource_url(f"music/jacket/{correct_song['jacketAssetbundleName']}/{correct_song['jacketAssetbundleName']}.png")
-            answer_reveal_messages = [
-                Comp.Plain(f"正确答案是:\n{game_data['correct_answer_num']}. {correct_song['title']}\n"),
-            ]
-            if jacket_source:
-                answer_reveal_messages.append(Comp.Image(file=str(jacket_source)))
-            
-            game_logs, score_updates = await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
-            if game_logs or score_updates:
-                asyncio.create_task(self._robust_send_stats(game_logs, score_updates))
+            await self._execute_game_round(event, session_id, game_data)
         except Exception as e:
             logger.error(f"游戏启动过程中发生未处理的异常: {e}", exc_info=True)
             await event.send(event.plain_result("......开始游戏时发生内部错误，已中断。"))
@@ -300,6 +498,8 @@ class GuessSongPlugin(Star):
             if session_id in self.context.active_game_sessions:
                 self.context.active_game_sessions.remove(session_id)
             self.last_game_end_time[session_id] = time.time()
+            if session_id in self.auto_game_sessions:
+                asyncio.create_task(self._auto_next_round(event, session_id, mode_key))
 
     @filter.command("随机猜歌", alias={"rgs"})
     async def start_random_guess_song(self, event: AstrMessageEvent):
@@ -318,10 +518,16 @@ class GuessSongPlugin(Star):
             self.context.active_game_sessions.add(session_id)
 
         try:
-            initiator_id = event.get_sender_id()
+            initiator_id, initiator_platform = await self._get_account_identity(event)
             initiator_name = event.get_sender_name()
             is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
-            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name, session_id, is_independent_limit)
+            await self.db_service.consume_daily_play_attempt(
+                initiator_id,
+                initiator_name,
+                session_id,
+                is_independent_limit,
+                initiator_platform,
+            )
             await self.stats_service.api_ping("guess_song_random")
 
             combined_kwargs, total_score, effect_names_display, mode_name_str = self.audio_service.get_random_mode_config()
@@ -334,43 +540,16 @@ class GuessSongPlugin(Star):
             combined_kwargs['score'] = total_score
             combined_kwargs['game_type'] = 'guess_song_random'
             
+            song_pool = self._get_song_pool(session_id)
+            if not song_pool:
+                await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
+                return
+            combined_kwargs['force_song_object'] = random.choice(song_pool)
             game_data = await self.audio_service.get_game_clip(**combined_kwargs)
             if not game_data:
                 await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
                 return
-
-            correct_song = game_data['song']
-            if not self.song_data:
-                await event.send(event.plain_result("......歌曲数据未加载，无法生成选项。"))
-                return
-                
-            other_songs = random.sample([s for s in self.song_data if s['id'] != correct_song['id']], 11)
-            options = [correct_song] + other_songs
-            random.shuffle(options)
-            
-            game_data['options'] = options
-            game_data['correct_answer_num'] = options.index(correct_song) + 1
-            
-            logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
-            
-            options_img_path = await self.audio_service.create_options_image(options)
-            timeout_seconds = self._get_setting_for_group(event, "answer_timeout", 30)
-            intro_text = f"嗯...\n这首歌是什么呢？请在{timeout_seconds}秒内发送编号回答哦～\n每个玩家有两次作答机会"
-            
-            intro_messages = [Comp.Plain(intro_text)]
-            if options_img_path:
-                intro_messages.append(Comp.Image(file=options_img_path))
-            
-            jacket_source = self.cache_service.get_resource_url(f"music/jacket/{correct_song['jacketAssetbundleName']}/{correct_song['jacketAssetbundleName']}.png")
-            answer_reveal_messages = [
-                Comp.Plain(f"正确答案是:\n{game_data['correct_answer_num']}. {correct_song['title']}\n"),
-            ]
-            if jacket_source:
-                answer_reveal_messages.append(Comp.Image(file=str(jacket_source)))
-            
-            game_logs, score_updates = await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
-            if game_logs or score_updates:
-                asyncio.create_task(self._robust_send_stats(game_logs, score_updates))
+            await self._execute_game_round(event, session_id, game_data)
         except Exception as e:
             logger.error(f"游戏启动过程中发生未处理的异常: {e}", exc_info=True)
             await event.send(event.plain_result("......开始游戏时发生内部错误，已中断。"))
@@ -378,8 +557,113 @@ class GuessSongPlugin(Star):
             if session_id in self.context.active_game_sessions:
                 self.context.active_game_sessions.remove(session_id)
             self.last_game_end_time[session_id] = time.time()
+            if session_id in self.auto_game_sessions:
+                asyncio.create_task(self._auto_next_round(event, session_id, 'random'))
 
-    async def _run_game_session(self, event: AstrMessageEvent, game_data: Dict, intro_messages: List, answer_reveal_messages: List) -> Tuple[List[Dict], List[Dict]]:
+    @filter.command("自动猜歌", alias={"连续猜歌", "autogs"})
+    async def start_auto_guess_song(self, event: AstrMessageEvent):
+        """进入自动猜歌模式，结束后自动开启下一局"""
+        session_id = _get_normalized_session_id(event)
+        if session_id not in self.context.game_session_locks:
+            self.context.game_session_locks[session_id] = asyncio.Lock()
+        lock = self.context.game_session_locks[session_id]
+
+        msg = event.message_str.strip().lower()
+        if "随机" in msg or "random" in msg:
+            mode_key = 'random'
+        elif "2倍速" in msg or "二倍速" in msg or " 1" in msg:
+            mode_key = '1'
+        elif "倒放" in msg or " 2" in msg:
+            mode_key = '2'
+        else:
+            mode_key = 'normal'
+        yield event.plain_result("已开启自动猜歌模式！本局结束后将自动开始下一局。发送“退出自动模式”可关闭自动模式。")
+        async with lock:
+            can_start, message = await self._check_game_start_conditions(event)
+            if not can_start:
+                if message:
+                    await event.send(event.plain_result(message))
+                return
+            self.context.active_game_sessions.add(session_id)
+            self.auto_game_sessions[session_id] = mode_key
+            self.consecutive_no_answer.pop(session_id, None)  # 进入自动模式时重置计数器
+
+        try:
+            initiator_id, initiator_platform = await self._get_account_identity(event)
+            initiator_name = event.get_sender_name()
+            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
+            await self.db_service.consume_daily_play_attempt(
+                initiator_id,
+                initiator_name,
+                session_id,
+                is_independent_limit,
+                initiator_platform,
+            )
+
+            if mode_key == 'random':
+                await self.stats_service.api_ping("guess_song_random")
+                combined_kwargs, total_score, effect_names_display, mode_name_str = self.audio_service.get_random_mode_config()
+                if not combined_kwargs:
+                    await event.send(event.plain_result("......随机模式启动失败，没有可用的效果组合。"))
+                    return
+                await event.send(event.plain_result(f"好哒！本轮应用效果：【{effect_names_display}】(总计{total_score}分)"))
+                combined_kwargs['random_mode_name'] = f"random_{mode_name_str}"
+                combined_kwargs['score'] = total_score
+                combined_kwargs['game_type'] = 'guess_song_random'
+                song_pool = self._get_song_pool(session_id)
+                if not song_pool:
+                    await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
+                    return
+                combined_kwargs['force_song_object'] = random.choice(song_pool)
+                game_data = await self.audio_service.get_game_clip(**combined_kwargs)
+            else:
+                await self.stats_service.api_ping("guess_song")
+                mode_config = self.game_modes.get(mode_key)
+                if not mode_config:
+                    await event.send(event.plain_result(f"......未知的猜歌模式 '{mode_key}'。"))
+                    return
+                game_kwargs = mode_config['kwargs'].copy()
+                game_kwargs['score'] = mode_config.get('score', 1)
+                if 'reverse_audio' in game_kwargs:
+                    game_type_suffix = 'reverse'
+                elif 'speed_multiplier' in game_kwargs:
+                    game_type_suffix = 'speed_2x'
+                else:
+                    game_type_suffix = 'normal'
+                game_kwargs['game_type'] = f"guess_song_{game_type_suffix}"
+                song_pool = self._get_song_pool(session_id)
+                if not song_pool:
+                    await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
+                    return
+                game_kwargs['force_song_object'] = random.choice(song_pool)
+                game_data = await self.audio_service.get_game_clip(**game_kwargs)
+
+            if not game_data:
+                await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
+                return
+
+            success = await self._execute_game_round(event, session_id, game_data)
+            if not success:
+                self.auto_game_sessions.pop(session_id, None)
+        except Exception as e:
+            logger.error(f"自动猜歌启动异常: {e}", exc_info=True)
+            await event.send(event.plain_result("......开始游戏时发生内部错误，已中断。"))
+        finally:
+            if session_id in self.context.active_game_sessions:
+                self.context.active_game_sessions.remove(session_id)
+            self.last_game_end_time[session_id] = time.time()
+            if session_id in self.auto_game_sessions:
+                asyncio.create_task(self._auto_next_round(event, session_id, mode_key))
+
+    async def _run_game_session(
+        self,
+        event: AstrMessageEvent,
+        game_data: Dict,
+        intro_text: str,
+        intro_image_path: Optional[str],
+        answer_reveal_messages: List,
+        is_official_round: bool,
+    ) -> Tuple[List[Dict], List[Dict]]:
         """统一的游戏会话执行器，包含简化的统计逻辑。"""
         session_id = _get_normalized_session_id(event)
         debug_mode = self.config.get("debug_mode", False)
@@ -387,6 +671,7 @@ class GuessSongPlugin(Star):
         correct_players = {}
         first_correct_answer_time = 0
         game_ended_by_attempts = False
+        quit_ended_round = False
         user_guess_counts = {}
         guess_attempts_count = 0
         max_guess_attempts = self._get_setting_for_group(event, "max_guess_attempts", 10)
@@ -394,9 +679,31 @@ class GuessSongPlugin(Star):
         game_results_to_log = []
         score_updates_to_log = []
 
+        in_auto_mode = session_id in self.auto_game_sessions
+        official_self_id = self._get_official_self_id(event) if is_official_round else ""
         try:
             await event.send(event.chain_result([Comp.Record(file=game_data["clip_path"])]))
-            await event.send(event.chain_result(intro_messages))
+            if in_auto_mode:
+                # 自动模式：不出现 markdown 按钮，用文字提示退出方式
+                auto_intro = (
+                    intro_text
+                    + "\n发送「仅退出本局」可结束本局，发送「退出自动模式」可停止自动模式。"
+                )
+                await event.send(event.chain_result([Comp.Plain(auto_intro)]))
+            elif is_official_round and official_self_id:
+                # 官方机器人以 markdown 发送开局消息，附"仅退出本局 / 退出自动模式"连接
+                # （回答仍监听会话内全部消息，无需点击回答）
+                intro_md = intro_text + (
+                    "\n"
+                    + self._build_connect_link("仅退出本局", official_self_id)
+                    + "  "
+                    + self._build_connect_link("退出自动模式", official_self_id)
+                )
+                await self._send_markdown_text(event, intro_md)
+            else:
+                await event.send(event.chain_result([Comp.Plain(intro_text)]))
+            if intro_image_path:
+                await event.send(event.chain_result([Comp.Image(file=intro_image_path)]))
 
             if debug_mode:
                 logger.info("[猜歌插件] 调试模式已启用，立即显示答案")
@@ -416,18 +723,31 @@ class GuessSongPlugin(Star):
 
         @session_waiter(timeout=timeout_seconds)
         async def unified_waiter(controller: SessionController, answer_event: AstrMessageEvent):
-            nonlocal guess_attempts_count, correct_players, game_ended_by_attempts, first_correct_answer_time, user_guess_counts
-            
-            user_id = answer_event.get_sender_id()
+            nonlocal guess_attempts_count, correct_players, game_ended_by_attempts, first_correct_answer_time, user_guess_counts, quit_ended_round
+
+            user_id, platform_name = await self._get_account_identity(answer_event)
             user_name = answer_event.get_sender_name()
             answer_text = answer_event.message_str.strip()
-            
+
+            # 仅退出本局：只在游玩时生效，立即结束当前对局（不影响自动模式）
+            if answer_text == "仅退出本局":
+                quit_ended_round = True
+                controller.stop()
+                return
+
+            # 退出自动模式：任何时候可触发，本局继续、自动模式停止
+            if answer_text in ["退出自动模式", "退出"]:
+                if self.auto_game_sessions.pop(session_id, None) is not None:
+                    await answer_event.send(answer_event.plain_result("已退出自动模式，本局结束后将不再自动开始下一局。"))
+                return
+
             if not answer_text.isdigit():
                 return
             
-            if user_guess_counts.get(user_id, 0) >= max_guesses_per_user:
+            answer_key = (user_id, platform_name)
+            if user_guess_counts.get(answer_key, 0) >= max_guesses_per_user:
                 return
-            user_guess_counts[user_id] = user_guess_counts.get(user_id, 0) + 1
+            user_guess_counts[answer_key] = user_guess_counts.get(answer_key, 0) + 1
             
             is_correct = False
             try:
@@ -451,7 +771,14 @@ class GuessSongPlugin(Star):
                     score_to_add = game_data.get("score", 1)
 
             if game_data.get('game_type', '').startswith('guess_song'):
-                await self.db_service.update_stats(session_id, user_id, user_name, score_to_add, is_correct)
+                await self.db_service.update_stats(
+                    session_id,
+                    user_id,
+                    user_name,
+                    score_to_add,
+                    is_correct,
+                    platform_name,
+                )
                 if score_to_add > 0:
                     score_updates_to_log.append({
                         "user_id": user_id,
@@ -472,8 +799,8 @@ class GuessSongPlugin(Star):
                 })
 
             if is_correct and can_score:
-                if user_id not in correct_players:
-                    correct_players[user_id] = {'name': user_name}
+                if answer_key not in correct_players:
+                    correct_players[answer_key] = {'name': user_name}
                     if first_correct_answer_time == 0:
                         first_correct_answer_time = time.time()
                         end_game_early = self._get_setting_for_group(event, "end_game_after_bonus_time", True)
@@ -497,18 +824,203 @@ class GuessSongPlugin(Star):
             self.last_game_end_time[session_id] = time.time()
             if session_id in self.context.active_game_sessions:
                 self.context.active_game_sessions.remove(session_id)
+            # 追踪连续无人回答的局数：只要有人作答（无论对错）就不算无人回答
+            if session_id in self.auto_game_sessions:
+                if correct_players or user_guess_counts:
+                    self.consecutive_no_answer.pop(session_id, None)
+                else:
+                    self.consecutive_no_answer[session_id] = self.consecutive_no_answer.get(session_id, 0) + 1
         
-        summary_prefix = f"本轮猜测已达上限({max_guess_attempts}次)！" if game_ended_by_attempts else "时间到！"
+        round_server = self._server_for_session(session_id)
+        if quit_ended_round:
+            summary_prefix = "本局已结束（仅退出本局）"
+        elif game_ended_by_attempts:
+            summary_prefix = f"本轮猜测已达上限({max_guess_attempts}次)！"
+        else:
+            summary_prefix = "时间到！"
         if correct_players:
             winner_names = "、".join(player['name'] for player in correct_players.values())
             summary_text = f"{summary_prefix}\n本轮答对的玩家有：\n{winner_names}"
-            await event.send(event.plain_result(summary_text))
         else:
             summary_text = f"{summary_prefix} 啊...好像没有人答对呢......"
+
+        if session_id in self.auto_game_sessions:
+            # 自动模式：只显示结果与歌名，随后自动开始下一局，不出现 markdown 按钮
             await event.send(event.plain_result(summary_text))
-            
+        else:
+            summary_text += "\n" + "\n".join(self._build_server_footer(event, round_server))
+            if is_official_round:
+                # 官方机器人以 markdown 渲染结算消息，附切换/绑定/查分/排行榜连接与快捷入口
+                await self._send_markdown_text(event, summary_text)
+            else:
+                await event.send(event.plain_result(summary_text))
+
         await event.send(event.chain_result(answer_reveal_messages))
         return game_results_to_log, score_updates_to_log
+
+    async def _execute_game_round(self, event: AstrMessageEvent, session_id: str, game_data: Dict) -> bool:
+        """执行一轮猜歌游戏的核心流程（生成选项、发送音频、等待回答、公布答案）。"""
+        correct_song = game_data['song']
+        pool = self._get_song_pool(session_id)
+        if len(pool) < 12:
+            await event.send(event.plain_result("......题库歌曲数量不足，无法生成选项。"))
+            return False
+
+        other_songs = random.sample([s for s in pool if s['id'] != correct_song['id']], 11)
+        options = [correct_song] + other_songs
+        random.shuffle(options)
+
+        game_data['options'] = options
+        game_data['correct_answer_num'] = options.index(correct_song) + 1
+
+        logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
+
+        options_img_path = await self.audio_service.create_options_image(options)
+
+        answer_timeout = self._get_setting_for_group(event, "answer_timeout", 30)
+        intro_text = f"嗯...\n这首歌是什么呢？请在{answer_timeout}秒内发送编号回答哦～\n每个玩家有2次作答机会"
+
+        jacket_source = self.cache_service.get_resource_url(f"music/jacket/{correct_song['jacketAssetbundleName']}/{correct_song['jacketAssetbundleName']}.png")
+        answer_reveal_messages = [
+            Comp.Plain(f"正确答案是:\n{game_data['correct_answer_num']}. {correct_song.get('cn', correct_song['title'])}\n"),
+        ]
+        if jacket_source:
+            answer_reveal_messages.append(Comp.Image(file=str(jacket_source)))
+
+        is_official_round = self._get_event_platform_name(event) == OFFICIAL_PLATFORM_NAME
+        game_logs, score_updates = await self._run_game_session(
+            event, game_data, intro_text, options_img_path, answer_reveal_messages, is_official_round
+        )
+        if game_logs or score_updates:
+            asyncio.create_task(self._robust_send_stats(game_logs, score_updates))
+        return True
+
+    async def _auto_next_round(self, event: AstrMessageEvent, session_id: str, mode_key: str):
+        """自动猜歌：延迟后启动下一局。期间监听「退出自动模式」消息。"""
+        from astrbot.core.utils.session_waiter import session_waiter, SessionController, SessionFilter
+
+        class AutoSessionFilter(SessionFilter):
+            def filter(self, ev) -> str:
+                return _get_normalized_session_id(ev)
+
+        @session_waiter(timeout=5, record_history_chains=False)
+        async def quit_waiter(controller: SessionController, waiter_event: AstrMessageEvent):
+            if waiter_event.message_str.strip() in ["退出自动模式", "退出"]:
+                if self.auto_game_sessions.pop(session_id, None) is not None:
+                    await waiter_event.send(waiter_event.plain_result("已退出自动模式。"))
+                controller.stop()
+
+        try:
+            await quit_waiter(event, session_filter=AutoSessionFilter())
+            if session_id not in self.auto_game_sessions:
+                return
+        except TimeoutError:
+            pass
+
+        # 连续3局无人回答，自动停止
+        if self.consecutive_no_answer.get(session_id, 0) >= 3:
+            self.auto_game_sessions.pop(session_id, None)
+            self.consecutive_no_answer.pop(session_id, None)
+            await event.send(event.plain_result("连续3局无人回答，自动猜歌已停止。"))
+            return
+
+        if session_id not in self.auto_game_sessions:
+            return
+        await event.send(event.plain_result("下一局即将开始…发送「退出自动模式」可停止"))
+        await asyncio.sleep(2)
+        if session_id not in self.auto_game_sessions:
+            return
+
+        if session_id not in self.context.game_session_locks:
+            self.context.game_session_locks[session_id] = asyncio.Lock()
+        lock = self.context.game_session_locks[session_id]
+
+        async with lock:
+            if not await self._is_group_allowed(event):
+                self.auto_game_sessions.pop(session_id, None)
+                return
+            if session_id in self.context.active_game_sessions:
+                return
+            self.context.active_game_sessions.add(session_id)
+
+        try:
+            initiator_id, initiator_platform = await self._get_account_identity(event)
+            initiator_name = event.get_sender_name()
+            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
+            play_limit = self._get_setting_for_group(event, "daily_play_limit", 15)
+            can_play = await self.db_service.can_play(
+                initiator_id,
+                play_limit,
+                session_id,
+                is_independent_limit,
+                initiator_platform,
+            )
+            if not can_play:
+                await event.send(event.plain_result(f"......自动猜歌已停止：今日次数已达上限（{play_limit}次）。"))
+                self.auto_game_sessions.pop(session_id, None)
+                return
+            await self.db_service.consume_daily_play_attempt(
+                initiator_id,
+                initiator_name,
+                session_id,
+                is_independent_limit,
+                initiator_platform,
+            )
+
+            if mode_key == 'random':
+                await self.stats_service.api_ping("guess_song_random")
+                combined_kwargs, total_score, effect_names_display, mode_name_str = self.audio_service.get_random_mode_config()
+                if not combined_kwargs:
+                    await event.send(event.plain_result("......随机模式启动失败，没有可用的效果组合。"))
+                    return
+                await event.send(event.plain_result(f"好哒！本轮应用效果：【{effect_names_display}】(总计{total_score}分)"))
+                combined_kwargs['random_mode_name'] = f"random_{mode_name_str}"
+                combined_kwargs['score'] = total_score
+                combined_kwargs['game_type'] = 'guess_song_random'
+                song_pool = self._get_song_pool(session_id)
+                if not song_pool:
+                    await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
+                    return
+                combined_kwargs['force_song_object'] = random.choice(song_pool)
+                game_data = await self.audio_service.get_game_clip(**combined_kwargs)
+            else:
+                await self.stats_service.api_ping("guess_song")
+                mode_config = self.game_modes.get(mode_key)
+                if not mode_config:
+                    return
+                game_kwargs = mode_config['kwargs'].copy()
+                game_kwargs['score'] = mode_config.get('score', 1)
+                if 'reverse_audio' in game_kwargs:
+                    game_type_suffix = 'reverse'
+                elif 'speed_multiplier' in game_kwargs:
+                    game_type_suffix = 'speed_2x'
+                else:
+                    game_type_suffix = 'normal'
+                game_kwargs['game_type'] = f"guess_song_{game_type_suffix}"
+                song_pool = self._get_song_pool(session_id)
+                if not song_pool:
+                    await event.send(event.plain_result("......歌曲数据未加载，无法开始游戏。"))
+                    return
+                game_kwargs['force_song_object'] = random.choice(song_pool)
+                game_data = await self.audio_service.get_game_clip(**game_kwargs)
+
+            if not game_data:
+                await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
+                return
+
+            success = await self._execute_game_round(event, session_id, game_data)
+            if not success:
+                self.auto_game_sessions.pop(session_id, None)
+        except Exception as e:
+            logger.error(f"自动猜歌下一局异常: {e}", exc_info=True)
+            await event.send(event.plain_result("......自动猜歌发生错误，已停止。"))
+            self.auto_game_sessions.pop(session_id, None)
+        finally:
+            if session_id in self.context.active_game_sessions:
+                self.context.active_game_sessions.remove(session_id)
+            self.last_game_end_time[session_id] = time.time()
+            if session_id in self.auto_game_sessions:
+                asyncio.create_task(self._auto_next_round(event, session_id, mode_key))
 
     @filter.command("猜歌帮助")
     async def show_guess_song_help(self, event: AstrMessageEvent):
@@ -521,6 +1033,84 @@ class GuessSongPlugin(Star):
             await event.send(event.image_result(img_path))
         else:
             await event.send(event.plain_result("生成帮助图片时出错。"))
+
+    @filter.command("猜歌切换国服题库", alias={"猜歌切换国服"})
+    async def switch_to_sc(self, event: AstrMessageEvent):
+        """切换为国服题库。"""
+        await self._switch_server(event, SERVER_SC)
+
+    @filter.command("猜歌切换日服题库", alias={"猜歌切换日服"})
+    async def switch_to_jp(self, event: AstrMessageEvent):
+        """切换为日服题库。"""
+        await self._switch_server(event, SERVER_JP)
+
+    @filter.command("猜歌绑定", alias={"pjsk猜歌绑定", "猜歌绑定QQ"})
+    async def bind_song_account(self, event: AstrMessageEvent):
+        """QQ 官方机器人账号绑定到普通 QQ 账号。"""
+        if not self._is_qq_official_event(event):
+            await event.send(event.plain_result("此绑定功能仅支持 QQ 官方机器人使用。"))
+            return
+
+        parts = event.message_str.strip().split(maxsplit=1)
+        qq_user_id = parts[1].strip() if len(parts) > 1 else ""
+        if not qq_user_id.isdigit() or not 5 <= len(qq_user_id) <= 12:
+            await event.send(event.plain_result("请按“猜歌绑定 QQ号”的格式输入，例如：猜歌绑定 21555762216。"))
+            return
+
+        official_user_id = str(event.get_sender_id())
+        current_user_id = await self.db_service.resolve_user_id(
+            OFFICIAL_PLATFORM_NAME,
+            official_user_id,
+        )
+        if str(current_user_id) != official_user_id:
+            await event.send(event.plain_result(f"当前官方机器人账号已经绑定至 QQ号 {current_user_id}。"))
+            return
+
+        await event.send(event.plain_result(self._build_binding_confirmation_message(qq_user_id)))
+        decision = None
+
+        @session_waiter(timeout=60)
+        async def binding_waiter(controller: SessionController, answer_event: AstrMessageEvent):
+            nonlocal decision
+            answer_text = answer_event.message_str.strip()
+            if answer_text == "确认":
+                decision = "confirm"
+                controller.stop()
+            elif answer_text == "取消":
+                decision = "cancel"
+                controller.stop()
+
+        try:
+            await binding_waiter(
+                event,
+                session_filter=BindingSessionFilter(event.unified_msg_origin, official_user_id),
+            )
+        except TimeoutError:
+            await event.send(event.plain_result("绑定确认已超时，绑定操作已取消。"))
+            return
+
+        if decision == "cancel":
+            await event.send(event.plain_result("已取消绑定。"))
+            return
+        if decision != "confirm":
+            await event.send(event.plain_result("未收到有效的绑定确认，绑定操作已取消。"))
+            return
+
+        bound = await self.db_service.bind_official_account(official_user_id, qq_user_id)
+        if bound:
+            await event.send(event.plain_result(f"绑定成功！官方机的历史分数已迁移至 QQ号 {qq_user_id}。"))
+        else:
+            await event.send(event.plain_result("绑定失败：该官方账号可能已绑定，请稍后重试。"))
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_all_message_detect_quit(self, event: AstrMessageEvent):
+        """监听所有消息：发送"退出自动模式"停止自动猜歌（本局进行中时由对局等待器处理）"""
+        if str(event.message_str or "").strip() in ["退出自动模式", "退出"]:
+            session_id = _get_normalized_session_id(event)
+            if session_id in self.context.active_game_sessions:
+                return
+            if self.auto_game_sessions.pop(session_id, None) is not None:
+                await event.send(event.plain_result("已退出自动模式。"))
 
     @filter.command("群猜歌排行榜", alias={"gssrank", "gstop"})
     async def show_ranking(self, event: AstrMessageEvent):
@@ -560,23 +1150,40 @@ class GuessSongPlugin(Star):
             await event.send(event.plain_result("生成排行榜图片时出错。"))
 
    
-    @filter.command("猜歌分数", alias={"gsscore", "我的猜歌分数"})
+    @filter.command("猜歌分数", alias={"gsscore", "我的猜歌分数", "猜歌个人分数"})
     async def show_user_score(self, event: AstrMessageEvent):
         """显示用户在本群、服务器和本地的总分数统计。"""
-        user_id = str(event.get_sender_id())
+        raw_user_id = str(event.get_sender_id())
+        user_id, platform_name = await self._get_account_identity(event)
         user_name = event.get_sender_name()
         session_id = _get_normalized_session_id(event)
+        raw_platform_name = self._get_event_platform_name(event)
+        platform_display_name = {
+            OFFICIAL_PLATFORM_NAME: "QQ官方机器人",
+            DEFAULT_PLATFORM_NAME: "普通QQ",
+        }.get(raw_platform_name, raw_platform_name)
+        identity_lines = [
+            f"👤 用户ID: {raw_user_id}",
+            f"🌐 平台: {platform_display_name}（{raw_platform_name}）",
+        ]
+        if raw_platform_name == OFFICIAL_PLATFORM_NAME and user_id == raw_user_id:
+            identity_lines.extend([
+                "当前官方机器人账号尚未绑定QQ号。",
+                "如需将官方机分数迁移到普通QQ账号，请发送：猜歌绑定 QQ号",
+            ])
+        elif user_id != raw_user_id:
+            identity_lines.append(f"🔗 统计账号: {user_id}")
         
         server_stats_task = asyncio.create_task(self.stats_service.api_get_user_global_stats(user_id))
         
-        group_stats_task = self.db_service.get_user_stats_in_group(user_id, session_id)
-        local_global_stats_task = self.db_service.get_user_local_global_stats(user_id)
+        group_stats_task = self.db_service.get_user_stats_in_group(user_id, session_id, platform_name)
+        local_global_stats_task = self.db_service.get_user_local_global_stats(user_id, platform_name)
         
         server_stats, group_stats, local_global_stats = await asyncio.gather(
             server_stats_task, group_stats_task, local_global_stats_task
         )
         
-        result_parts = [f"📊 {user_name} 的猜歌报告"]
+        result_parts = ["\n".join(identity_lines), f"📊 {user_name} 的猜歌报告"]
         
         if group_stats:
             group_score = group_stats.get('score', 0)
@@ -665,7 +1272,7 @@ class GuessSongPlugin(Star):
         if not await self._is_group_allowed(event):
             return
 
-        user_id = str(event.get_sender_id())
+        user_id, _ = await self._get_account_identity(event)
         user_name = event.get_sender_name()
 
         # 直接在代码中定义最低次数门槛
@@ -804,7 +1411,7 @@ class GuessSongPlugin(Star):
         options_img_path = await self.audio_service.create_options_image(options)
         
         applied_effects = "、".join(effect_names)
-        intro_text = f"--- 调试模式 ---\n歌曲: {correct_song['title']}\n效果: {applied_effects}\n答案: {correct_answer_num}"
+        intro_text = f"--- 调试模式 ---\n歌曲: {correct_song.get('cn', correct_song['title'])}\n效果: {applied_effects}\n答案: {correct_answer_num}"
         
         msg_chain = [Comp.Plain(intro_text)]
         if options_img_path:
@@ -900,4 +1507,13 @@ class GuessSongPlugin(Star):
         await self.cache_service.terminate()
         await self.audio_service.terminate()
         await self.stats_service.terminate()
+        # 停止题库自动同步服务
+        try:
+            self._master_task.cancel()
+        except Exception:
+            pass
+        try:
+            await self.master_data.terminate()
+        except Exception as e:
+            logger.warning(f"停止题库同步服务时出错: {e}")
         logger.info("猜歌插件已终止。")

@@ -232,7 +232,7 @@ class AudioService:
                                 fill=(0, 0, 0, 180))
                 with Pilmoji(img) as pilmoji_drawer:
                     pilmoji_drawer.text(circle_center, num_text, font=num_font, fill=(255, 255, 255), anchor="mm")
-                title = option['title']
+                title = option.get('cn', option['title'])
                 if title_font.getbbox(title)[2] > jacket_w:
                     while title_font.getbbox(title + "...")[2] > jacket_w and len(title) > 1:
                         title = title[:-1]
@@ -254,15 +254,16 @@ class AudioService:
         return await loop.run_in_executor(self.executor, self._draw_ranking_image_sync, rows, title_text, max_rows, date_range_str)
 
     def _draw_ranking_image_sync(self, rows, title_text="猜歌排行榜", max_rows: int = 10, date_range_str: Optional[str] = None) -> Optional[str]:
+        """渲染与猜卡面排行榜一致的横向表格图片"""
         try:
             rows = rows[:max_rows]
-            row_count = len(rows)
-            row_px = 70
-            header_px = 160
-            footer_px = 60
-            width = 900
-            height = header_px + row_count * row_px + footer_px
-            bg_color_start, bg_color_end = (230, 240, 255), (200, 210, 240)
+            width = 850
+            base_height = 250
+            item_height = 70
+            height = base_height + len(rows) * item_height
+
+            bg_color_start = (230, 240, 255)
+            bg_color_end = (200, 210, 240)
             img = Image.new("RGB", (width, height), bg_color_start)
             draw_bg = ImageDraw.Draw(img)
             for y in range(height):
@@ -271,11 +272,18 @@ class AudioService:
                 b = int(bg_color_start[2] + (bg_color_end[2] - bg_color_start[2]) * y / height)
                 draw_bg.line([(0, y), (width, y)], fill=(r, g, b))
 
-            if img.mode != 'RGBA': img = img.convert('RGBA')
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+
             white_overlay = Image.new("RGBA", img.size, (255, 255, 255, 100))
             img = Image.alpha_composite(img, white_overlay)
-            font_color, shadow_color = (30, 30, 50), (180, 180, 190, 128)
-            header_color, score_color, accuracy_color = (80, 90, 120), (235, 120, 20), (0, 128, 128)
+
+            title_text = title_text or "猜歌排行榜"
+            font_color = (30, 30, 50)
+            shadow_color = (180, 180, 190, 128)
+            header_color = (80, 90, 120)
+            score_color = (235, 120, 20)
+            accuracy_color = (0, 128, 128)
             try:
                 font_path = self.resources_dir / "font.ttf"
                 title_font = ImageFont.truetype(str(font_path), 48)
@@ -286,46 +294,91 @@ class AudioService:
             except IOError:
                 title_font, header_font, body_font, id_font = [ImageFont.load_default()] * 4
                 medal_font = body_font
+
             with Pilmoji(img) as pilmoji:
                 center_x, title_y = int(width / 2), 80
-                pilmoji.text((center_x + 2, title_y + 2), title_text, font=title_font, fill=shadow_color, anchor="mm")
-                pilmoji.text((center_x, title_y), title_text, font=title_font, fill=font_color, anchor="mm")
+                pilmoji.text((center_x + 2, title_y + 2), title_text, font=title_font, fill=shadow_color, anchor="mm", emoji_position_offset=(0, 6))
+                pilmoji.text((center_x, title_y), title_text, font=title_font, fill=font_color, anchor="mm", emoji_position_offset=(0, 6))
+
                 headers = ["排名", "玩家", "总分", "正确率", "总次数"]
-                col_positions_header = [60, 170, 460, 640, 790]
+                col_positions_header = [40, 150, 500, 610, 720]
                 current_y = title_y + int(pilmoji.getsize(title_text, font=title_font)[1] / 2) + 45
-                for i, header in enumerate(headers):
-                    pilmoji.text((col_positions_header[i], current_y), header, font=header_font, fill=header_color)
+                for header in headers:
+                    pilmoji.text((col_positions_header.pop(0), current_y), header, font=header_font, fill=header_color)
+
                 current_y += 55
                 rank_icons = ["🥇", "🥈", "🥉"]
+
                 for i, row in enumerate(rows):
                     user_id, user_name, score, attempts, correct_attempts = str(row[0]), row[1], str(row[2]), str(row[3]), row[4]
-                    if attempts == -1:
-                        accuracy = "N/A"
-                        attempts_str = "N/A"
+                    is_unbound_official = bool(row[5]) if len(row) > 5 else False
+                    display_name = user_name if user_name else "未知用户"
+                    if attempts == "-1":
+                        accuracy = "—"
+                        attempts_str = "—"
                     else:
-                        attempts_str = str(attempts)
+                        attempts_str = attempts
                         accuracy = f"{(correct_attempts * 100 / int(attempts) if int(attempts) > 0 else 0):.1f}%"
+
                     rank = i + 1
-                    col_positions = [60, 170, 460, 640, 790]
-                    pilmoji.text((150, current_y), str(rank), font=body_font, fill=font_color, anchor="ra")
+                    col_positions = [40, 150, 500, 610, 720]
+                    rank_num_align_x = 130
+                    pilmoji.text((rank_num_align_x, current_y), str(rank), font=body_font, fill=font_color, anchor="ra")
+
                     if i < 3:
-                        pilmoji.text((col_positions[0], current_y - 2), rank_icons[i], font=medal_font, fill=font_color)
-                    max_name_width = col_positions[2] - col_positions[1] - 20
-                    if body_font.getbbox(user_name)[2] > max_name_width:
-                        while body_font.getbbox(user_name + "...")[2] > max_name_width and len(user_name) > 0:
-                            user_name = user_name[:-1]
-                        user_name += "..."
-                    pilmoji.text((col_positions[1], current_y), user_name, font=body_font, fill=font_color)
-                    pilmoji.text((col_positions[1], current_y + 32), f"ID: {user_id}", font=id_font, fill=header_color)
+                        pilmoji.text((col_positions[0], current_y - 30), rank_icons[i], font=medal_font, fill=font_color)
+
+                    name_x = col_positions[1]
+                    if is_unbound_official:
+                        badge_text = "未绑定QQ"
+                        badge_text_width = pilmoji.getsize(badge_text, font=id_font)[0]
+                        badge_width = badge_text_width + 16
+                        badge_height = 26
+                        badge_y = current_y + 3
+                        draw = ImageDraw.Draw(img)
+                        draw.rounded_rectangle(
+                            [name_x, badge_y, name_x + badge_width, badge_y + badge_height],
+                            radius=8,
+                            fill=(115, 125, 150, 230),
+                        )
+                        pilmoji.text(
+                            (name_x + 8, badge_y + 4),
+                            badge_text,
+                            font=id_font,
+                            fill=(255, 255, 255, 255),
+                        )
+                        name_x += badge_width + 10
+
+                    max_name_width = col_positions[2] - name_x - 20
+                    if body_font.getbbox(display_name)[2] > max_name_width:
+                        while body_font.getbbox(display_name + "...")[2] > max_name_width and len(display_name) > 0:
+                            display_name = display_name[:-1]
+                        display_name += "..."
+
+                    pilmoji.text((name_x, current_y), display_name, font=body_font, fill=font_color)
+                    id_text = f"{user_name} ID: {user_id}"
+                    max_id_width = col_positions[2] - col_positions[1] - 20
+                    if id_font.getbbox(id_text)[2] > max_id_width:
+                        while id_font.getbbox(id_text + "...")[2] > max_id_width and len(id_text) > 0:
+                            id_text = id_text[:-1]
+                        id_text += "..."
+                    # ID 小字固定从玩家列左侧开始，不能跟随未绑定徽章后的名称位置右移。
+                    pilmoji.text((col_positions[1], current_y + 32), id_text, font=id_font, fill=header_color)
                     pilmoji.text((col_positions[2], current_y), score, font=body_font, fill=score_color)
                     pilmoji.text((col_positions[3], current_y), accuracy, font=body_font, fill=accuracy_color)
                     pilmoji.text((col_positions[4], current_y), attempts_str, font=body_font, fill=font_color)
+
+                    separator_y = current_y + 60
                     if i < len(rows) - 1:
                         draw = ImageDraw.Draw(img)
-                        draw.line([(40, current_y + 60), (width - 40, current_y + 60)], fill=(200, 200, 210, 128), width=1)
-                    current_y += row_px
-                footer_text = f"GuessSong v{self.plugin_version} | mzkbot by 慵懒午睡"
-                pilmoji.text((center_x, height - 25), footer_text, font=id_font, fill=header_color, anchor="ms")
+                        draw.line([(30, separator_y), (width - 30, separator_y)], fill=(200, 200, 210, 128), width=1)
+
+                    current_y += 70
+
+                footer_text = f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                footer_y = height - 25
+                pilmoji.text((center_x, footer_y), footer_text, font=id_font, fill=header_color, anchor="ms")
+
             img_path = self.output_dir / f"song_ranking_{int(time.time())}.png"
             img.save(img_path)
             return str(img_path)
@@ -375,6 +428,7 @@ class AudioService:
                 "  `随机猜歌` - 随机组合效果 (最高3分)\n\n"
                 "📊 数据统计\n"
                 "  `猜歌分数` - 查看自己的猜歌积分和排名\n"
+                "  `猜歌绑定 QQ号` - QQ官方机器人绑定到你的QQ号，需发送“确认”\n"
                 "  `群猜歌排行榜` - 查看本群猜歌排行榜\n"
                 "  `本地猜歌排行榜` - 查看插件本地存储的猜歌排行榜\n"
                 "  `查看统计` - 查看个人各题型正确率统计\n"
@@ -405,7 +459,7 @@ class AudioService:
 
                     pilmoji.text((x_margin, int(current_y)), text_to_draw, font=font, fill=font_color)
                     current_y += y_increment
-                footer_text = f"GuessSong v{self.plugin_version} | mzkbot by 慵懒午睡"
+                footer_text = f"GuessSong v{self.plugin_version}"
                 pilmoji.text((int(center_x), height - 40), footer_text, font=id_font, fill=header_color, anchor="ms")
             img_path = self.output_dir / f"guess_song_help_{int(time.time())}.png"
             img.save(img_path)
@@ -605,7 +659,7 @@ class AudioService:
                     pilmoji.text((x_percent, y), f"{accuracy:.1f}%", font=font_body_bold, fill=c_highlight, anchor="rs")
                     y += 42
 
-                footer_text = f"GuessSong v{self.plugin_version} | mzkbot by 慵懒午睡"
+                footer_text = f"GuessSong v{self.plugin_version} |"
                 pilmoji.text((center_x, height - 65), footer_text, font=font_footer, fill=c_dim, anchor="ms")
 
             output_path = self.output_dir / f"personal_stats_{user_name}_{int(time.time())}.png"
