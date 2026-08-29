@@ -87,7 +87,6 @@
 | `ranking_row_limit` | int | `10` | 排行榜显示人数 |
 | `jp_resource_url_base` | string | `https://storage.exmeaning.com/sekai-jp-assets` | 日服音频/封面资源根地址 |
 | `sc_resource_url_base` | string | `https://storage.exmeaning.com/sekai-sc-assets` | 国服音频/封面资源根地址 |
-| `remote_resource_url_base` | string | （兼容旧配置） | 旧版日服资源地址迁移兜底，不建议新配置使用 |
 | `stats_server_api_key` | string | `""` | 统计服务器 API 密钥（留空禁用在线同步） |
 | `debug_mode` | bool | `false` | 调试模式（立即显示答案） |
 | `group_whitelist` | list | `[]` | 群聊白名单（为空则所有群可用） |
