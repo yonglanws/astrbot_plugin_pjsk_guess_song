@@ -70,7 +70,7 @@ class CustomSessionFilter(SessionFilter):
 PLUGIN_NAME = "pjsk_guess_song"
 PLUGIN_AUTHOR = "nichinichisou"
 PLUGIN_DESCRIPTION = "PJSK猜歌插件"
-PLUGIN_VERSION = "1.2.1"
+PLUGIN_VERSION = "1.2.2"
 PLUGIN_REPO_URL = "https://github.com/nichinichisou0609/astrbot_plugin_pjsk_guess_song"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"

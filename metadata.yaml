@@ -1,7 +1,7 @@
 name: pjsk_guess_song # 这是你的插件的唯一识别名。
 display_name: PJSK猜歌插件
 desc: PJSK猜歌插件，原作者停止维护，由本人维护的猜歌插件后续分支 # 插件简短描述
-version: v1.2.1 # 插件版本号。格式：v1.1.1 或者 v1.1
+version: v1.2.2 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: nichinichisou & 慵懒午睡 # 作者
 repo: https://github.com/yonglanws/astrbot_plugin_pjsk_guess_song # 插件的仓库地址
 support_platforms:                         # （可选）支持的平台适配器列表
