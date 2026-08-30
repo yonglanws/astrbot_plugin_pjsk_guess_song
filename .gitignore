@@ -216,8 +216,7 @@ output/
 
 # Ignore all contents of the resources directory...
 resources/*
-tests/_render_out/
-tests/_integration/
+tests/
 
 # ...but re-include the essential files.
 !resources/characters.json
