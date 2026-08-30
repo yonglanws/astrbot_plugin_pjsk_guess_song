@@ -70,7 +70,7 @@ class CustomSessionFilter(SessionFilter):
 PLUGIN_NAME = "pjsk_guess_song"
 PLUGIN_AUTHOR = "nichinichisou"
 PLUGIN_DESCRIPTION = "PJSK猜歌插件"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.2.1"
 PLUGIN_REPO_URL = "https://github.com/nichinichisou0609/astrbot_plugin_pjsk_guess_song"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
@@ -127,7 +127,7 @@ class GuessSongPlugin(Star):
         data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         data_dir.mkdir(parents=True, exist_ok=True)
         db_path = data_dir / "guess_song_data.db"
-        self.group_settings_path = self.plugin_dir / "group_settings.json"
+        self.group_settings_path = data_dir / "group_settings.json"
         self.group_settings = self._load_group_settings()
         self.db_service = DBService(str(db_path))
         self.stats_service = StatsService(config)
@@ -140,6 +140,8 @@ class GuessSongPlugin(Star):
         self.last_game_end_time = {}
         self.auto_game_sessions = {}  # session_id -> mode_key
         self.consecutive_no_answer = {}  # session_id -> int (连续无人回答的局数)
+        self._background_tasks: set[asyncio.Task] = set()
+        self._stopping = False
 
         # 内置静态曲池（master 题库未就绪时的回退数据源，_async_init 中加载）
         self.song_data: List[Dict] = []
@@ -158,9 +160,14 @@ class GuessSongPlugin(Star):
         self.mode_name_map = self.audio_service.mode_name_map
 
         # 异步初始化任务
-        self._init_task = asyncio.create_task(self._async_init())
-        self._master_task = asyncio.create_task(self.master_data.start())
-        self._cleanup_task = asyncio.create_task(self.cache_service.periodic_cleanup_task())
+        self._init_task = self._track_task(asyncio.create_task(self._async_init()))
+        self._master_task = self._track_task(asyncio.create_task(self.master_data.start()))
+        self._cleanup_task = self._track_task(asyncio.create_task(self.cache_service.periodic_cleanup_task()))
+
+    def _track_task(self, task: asyncio.Task) -> asyncio.Task:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     # --- 题库服务器与 master 数据同步 ---
 
@@ -193,12 +200,14 @@ class GuessSongPlugin(Star):
         logger.info("[猜歌插件] 题库已随 master 数据更新。")
 
     def _get_song_pool(self, session_id: str) -> List[Dict]:
-        """获取会话当前服务器的曲池；master 题库未就绪时回退内置曲池。"""
+        """获取会话当前服务器的曲池，避免用日服回退数据请求国服资源。"""
         server = self._server_for_session(session_id)
         master_songs = self.master_data.get_songs(server)
         if master_songs:
             return master_songs
-        return self.song_data or []
+        if server == SERVER_JP:
+            return self.song_data or []
+        return []
 
     # --- 官机 markdown 机制（与 PJSK Wordle 一致） ---
 
@@ -371,7 +380,12 @@ class GuessSongPlugin(Star):
                 try:
                     start_time = datetime.strptime(period["start"], "%H:%M").time()
                     end_time = datetime.strptime(period["end"], "%H:%M").time()
-                    if start_time <= now_time < end_time:
+                    in_period = (
+                        start_time <= now_time < end_time
+                        if start_time <= end_time
+                        else now_time >= start_time or now_time < end_time
+                    )
+                    if in_period:
                         default_msg = f"当前时段 ({period['start']} - {period['end']}) 猜歌功能已禁用。"
                         return False, period.get("message", default_msg)
                 except (KeyError, ValueError) as e:
@@ -406,6 +420,31 @@ class GuessSongPlugin(Star):
 
         return True, None
     
+    async def _consume_daily_attempt(
+        self,
+        event: AstrMessageEvent,
+        session_id: str,
+        user_id: str,
+        user_name: str,
+        platform_name: str,
+    ) -> bool:
+        is_independent = self._get_setting_for_group(event, "independent_daily_limit", False)
+        limit = self._get_setting_for_group(event, "daily_play_limit", 15)
+        consumed = await self.db_service.consume_daily_play_attempt(
+            user_id,
+            user_name,
+            session_id,
+            is_independent,
+            platform_name,
+            daily_limit=limit,
+        )
+        if not consumed:
+            limit_type = "本群" if is_independent else "你"
+            await event.send(
+                event.plain_result(f"......{limit_type}今天的游戏次数已达上限（{limit}次）。")
+            )
+        return consumed
+
     async def _is_group_allowed(self, event: AstrMessageEvent) -> bool:
         """检查群组是否在白名单中, 如果不在则发送提示消息"""
         # 标准化白名单为字符串集合
@@ -470,14 +509,6 @@ class GuessSongPlugin(Star):
         try:
             initiator_id, initiator_platform = await self._get_account_identity(event)
             initiator_name = event.get_sender_name()
-            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
-            await self.db_service.consume_daily_play_attempt(
-                initiator_id,
-                initiator_name,
-                session_id,
-                is_independent_limit,
-                initiator_platform,
-            )
             await self.stats_service.api_ping("guess_song")
             
             mode_config = self.game_modes.get(mode_key)
@@ -494,6 +525,7 @@ class GuessSongPlugin(Star):
                 game_type_suffix = 'speed_2x'
             else:
                 game_type_suffix = 'normal'
+            game_kwargs['mode_key'] = mode_key
             game_kwargs['game_type'] = f"guess_song_{game_type_suffix}"
             
             song_pool = self._get_song_pool(session_id)
@@ -506,6 +538,14 @@ class GuessSongPlugin(Star):
             if not game_data:
                 await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
                 return
+            if not await self._consume_daily_attempt(
+                event,
+                session_id,
+                initiator_id,
+                initiator_name,
+                initiator_platform,
+            ):
+                return
             await self._execute_game_round(event, session_id, game_data)
         except Exception as e:
             logger.error(f"游戏启动过程中发生未处理的异常: {e}", exc_info=True)
@@ -515,7 +555,7 @@ class GuessSongPlugin(Star):
                 self.context.active_game_sessions.remove(session_id)
             self.last_game_end_time[session_id] = time.time()
             if session_id in self.auto_game_sessions:
-                asyncio.create_task(self._auto_next_round(event, session_id, mode_key))
+                self._track_task(asyncio.create_task(self._auto_next_round(event, session_id, mode_key)))
 
     @filter.command("随机猜歌", alias={"rgs"})
     async def start_random_guess_song(self, event: AstrMessageEvent):
@@ -536,14 +576,6 @@ class GuessSongPlugin(Star):
         try:
             initiator_id, initiator_platform = await self._get_account_identity(event)
             initiator_name = event.get_sender_name()
-            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
-            await self.db_service.consume_daily_play_attempt(
-                initiator_id,
-                initiator_name,
-                session_id,
-                is_independent_limit,
-                initiator_platform,
-            )
             await self.stats_service.api_ping("guess_song_random")
 
             combined_kwargs, total_score, effect_names_display, mode_name_str = self.audio_service.get_random_mode_config()
@@ -566,6 +598,14 @@ class GuessSongPlugin(Star):
             if not game_data:
                 await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
                 return
+            if not await self._consume_daily_attempt(
+                event,
+                session_id,
+                initiator_id,
+                initiator_name,
+                initiator_platform,
+            ):
+                return
             await self._execute_game_round(event, session_id, game_data)
         except Exception as e:
             logger.error(f"游戏启动过程中发生未处理的异常: {e}", exc_info=True)
@@ -575,7 +615,7 @@ class GuessSongPlugin(Star):
                 self.context.active_game_sessions.remove(session_id)
             self.last_game_end_time[session_id] = time.time()
             if session_id in self.auto_game_sessions:
-                asyncio.create_task(self._auto_next_round(event, session_id, 'random'))
+                self._track_task(asyncio.create_task(self._auto_next_round(event, session_id, 'random')))
 
     @filter.command("自动猜歌", alias={"连续猜歌", "autogs"})
     async def start_auto_guess_song(self, event: AstrMessageEvent):
@@ -608,14 +648,6 @@ class GuessSongPlugin(Star):
         try:
             initiator_id, initiator_platform = await self._get_account_identity(event)
             initiator_name = event.get_sender_name()
-            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
-            await self.db_service.consume_daily_play_attempt(
-                initiator_id,
-                initiator_name,
-                session_id,
-                is_independent_limit,
-                initiator_platform,
-            )
 
             if mode_key == 'random':
                 await self.stats_service.api_ping("guess_song_random")
@@ -648,6 +680,7 @@ class GuessSongPlugin(Star):
                     game_type_suffix = 'speed_2x'
                 else:
                     game_type_suffix = 'normal'
+                game_kwargs['mode_key'] = mode_key
                 game_kwargs['game_type'] = f"guess_song_{game_type_suffix}"
                 song_pool = self._get_song_pool(session_id)
                 if not song_pool:
@@ -659,6 +692,16 @@ class GuessSongPlugin(Star):
 
             if not game_data:
                 await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
+                self.auto_game_sessions.pop(session_id, None)
+                return
+            if not await self._consume_daily_attempt(
+                event,
+                session_id,
+                initiator_id,
+                initiator_name,
+                initiator_platform,
+            ):
+                self.auto_game_sessions.pop(session_id, None)
                 return
 
             success = await self._execute_game_round(event, session_id, game_data)
@@ -672,7 +715,7 @@ class GuessSongPlugin(Star):
                 self.context.active_game_sessions.remove(session_id)
             self.last_game_end_time[session_id] = time.time()
             if session_id in self.auto_game_sessions:
-                asyncio.create_task(self._auto_next_round(event, session_id, mode_key))
+                self._track_task(asyncio.create_task(self._auto_next_round(event, session_id, mode_key)))
 
     async def _run_game_session(
         self,
@@ -920,7 +963,7 @@ class GuessSongPlugin(Star):
             event, game_data, intro_text, options_img_path, answer_reveal_messages, is_official_round
         )
         if game_logs or score_updates:
-            asyncio.create_task(self._robust_send_stats(game_logs, score_updates))
+            self._track_task(asyncio.create_task(self._robust_send_stats(game_logs, score_updates)))
         return True
 
     async def _auto_next_round(self, event: AstrMessageEvent, session_id: str, mode_key: str):
@@ -974,26 +1017,6 @@ class GuessSongPlugin(Star):
         try:
             initiator_id, initiator_platform = await self._get_account_identity(event)
             initiator_name = event.get_sender_name()
-            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
-            play_limit = self._get_setting_for_group(event, "daily_play_limit", 15)
-            can_play = await self.db_service.can_play(
-                initiator_id,
-                play_limit,
-                session_id,
-                is_independent_limit,
-                initiator_platform,
-            )
-            if not can_play:
-                await event.send(event.plain_result(f"......自动猜歌已停止：今日次数已达上限（{play_limit}次）。"))
-                self.auto_game_sessions.pop(session_id, None)
-                return
-            await self.db_service.consume_daily_play_attempt(
-                initiator_id,
-                initiator_name,
-                session_id,
-                is_independent_limit,
-                initiator_platform,
-            )
 
             if mode_key == 'random':
                 await self.stats_service.api_ping("guess_song_random")
@@ -1025,6 +1048,7 @@ class GuessSongPlugin(Star):
                     game_type_suffix = 'speed_2x'
                 else:
                     game_type_suffix = 'normal'
+                game_kwargs['mode_key'] = mode_key
                 game_kwargs['game_type'] = f"guess_song_{game_type_suffix}"
                 song_pool = self._get_song_pool(session_id)
                 if not song_pool:
@@ -1036,6 +1060,16 @@ class GuessSongPlugin(Star):
 
             if not game_data:
                 await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
+                self.auto_game_sessions.pop(session_id, None)
+                return
+            if not await self._consume_daily_attempt(
+                event,
+                session_id,
+                initiator_id,
+                initiator_name,
+                initiator_platform,
+            ):
+                self.auto_game_sessions.pop(session_id, None)
                 return
 
             success = await self._execute_game_round(event, session_id, game_data)
@@ -1050,7 +1084,7 @@ class GuessSongPlugin(Star):
                 self.context.active_game_sessions.remove(session_id)
             self.last_game_end_time[session_id] = time.time()
             if session_id in self.auto_game_sessions:
-                asyncio.create_task(self._auto_next_round(event, session_id, mode_key))
+                self._track_task(asyncio.create_task(self._auto_next_round(event, session_id, mode_key)))
 
     @filter.command("猜歌帮助")
     async def show_guess_song_help(self, event: AstrMessageEvent):
@@ -1533,15 +1567,18 @@ class GuessSongPlugin(Star):
         logger.debug("后台统计数据发送任务完成。")
 
     async def terminate(self):
-        """关闭线程池和后台任务"""
-        await self.cache_service.terminate()
+        """取消后台任务并关闭服务资源。"""
+        self._stopping = True
+        tasks = [task for task in self._background_tasks if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        self.auto_game_sessions.clear()
+
         await self.audio_service.terminate()
         await self.stats_service.terminate()
-        # 停止题库自动同步服务
-        try:
-            self._master_task.cancel()
-        except Exception:
-            pass
         try:
             await self.master_data.terminate()
         except Exception as e:

@@ -1,8 +1,7 @@
 import asyncio
 import aiohttp
-import json
 from typing import Dict, Optional, List, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import urlparse, urlencode
 
 from astrbot.api import logger
@@ -11,11 +10,13 @@ from astrbot.api import AstrBotConfig
 class StatsService:
     def __init__(self, config: AstrBotConfig):
         self.api_key = config.get("stats_server_api_key")
-        self.stats_server_url = self._get_stats_server_root(config)
+        self.stats_server_url = str(config.get("stats_server_url", "") or "").strip().rstrip("/")
+        if not self.stats_server_url:
+            self.stats_server_url = self._get_legacy_stats_server_root(config)
         self._session: Optional[aiohttp.ClientSession] = None
 
-    def _get_stats_server_root(self, config: AstrBotConfig) -> Optional[str]:
-        """根据配置获取统计服务器的根URL。"""
+    def _get_legacy_stats_server_root(self, config: AstrBotConfig) -> Optional[str]:
+        """兼容旧配置：从资源服务器推导统计服务地址。"""
         url_base = config.get("remote_resource_url_base", "").strip('/')
         if not url_base:
             return None
@@ -185,7 +186,7 @@ class StatsService:
                         return None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"访问服务器时出错 (获取用户模式统计): {e}")
-            raise  # 重新抛出异常，让调用方处理
+            return None
         except Exception as e:
             logger.error(f"处理用户模式统计响应时发生未知错误: {e}")
             return None            

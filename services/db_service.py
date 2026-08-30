@@ -1,3 +1,4 @@
+import asyncio
 import aiosqlite
 import json
 from typing import List, Dict, Optional, Tuple
@@ -13,6 +14,7 @@ class DBService:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._write_lock = asyncio.Lock()
 
     def _get_conn(self) -> aiosqlite.Connection:
         """
@@ -263,62 +265,69 @@ class DBService:
         correct: bool,
         platform_name: str = DEFAULT_PLATFORM_NAME,
     ):
-        """异步更新用户统计数据，并能健壮地处理数据库中的脏数据。"""
-        async with self._get_conn() as conn:
-            conn.row_factory = aiosqlite.Row
-            async with conn.cursor() as cursor:
-                await self._ensure_user_exists(cursor, user_id, user_name, platform_name)
-                
-                await cursor.execute(
-                    "SELECT * FROM user_stats WHERE user_id = ? AND platform_name = ?",
-                    (user_id, platform_name),
-                )
-                user_stats = await cursor.fetchone()
+        """串行更新用户和群统计，避免跨会话读改写丢失结果。"""
+        async with self._write_lock:
+            async with self._get_conn() as conn:
+                conn.row_factory = aiosqlite.Row
+                async with conn.cursor() as cursor:
+                    await self._ensure_user_exists(cursor, user_id, user_name, platform_name)
+                    await cursor.execute(
+                        "SELECT * FROM user_stats WHERE user_id = ? AND platform_name = ?",
+                        (user_id, platform_name),
+                    )
+                    user_stats = await cursor.fetchone()
 
-                def safe_int(key: str) -> int:
-                    """一个安全的转换函数，用于处理可能存在的脏数据。"""
-                    if key not in user_stats.keys():
-                        return 0
-                    value = user_stats[key]
-                    if value is None:
-                        return 0
+                    def safe_int(key: str) -> int:
+                        try:
+                            return int(user_stats[key] or 0)
+                        except (KeyError, TypeError, ValueError):
+                            logger.warning(
+                                f"Corrupted data for user {user_id}, key '{key}'; treating as 0."
+                            )
+                            return 0
+
+                    attempts = safe_int("attempts") + 1
+                    correct_attempts = safe_int("correct_attempts") + (1 if correct else 0)
+                    current_score = safe_int("score") + (int(score) if correct else 0)
+                    correct_streak = safe_int("correct_streak") + 1 if correct else 0
+                    max_correct_streak = max(safe_int("max_correct_streak"), correct_streak)
+
                     try:
-                        return int(value)
-                    except (ValueError, TypeError):
-                        logger.warning(f"Corrupted data for user {user_id}, key '{key}': '{value}'. Treating as 0.")
-                        return 0
+                        group_scores = json.loads(user_stats["group_scores"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        group_scores = {}
+                    group_stat = group_scores.get(
+                        session_id, {"score": 0, "attempts": 0, "correct_attempts": 0}
+                    )
+                    if isinstance(group_stat, int):
+                        group_stat = {"score": group_stat, "attempts": 0, "correct_attempts": 0}
+                    group_stat["score"] = int(group_stat.get("score", 0) or 0) + (int(score) if correct else 0)
+                    group_stat["attempts"] = int(group_stat.get("attempts", 0) or 0) + 1
+                    group_stat["correct_attempts"] = (
+                        int(group_stat.get("correct_attempts", 0) or 0) + (1 if correct else 0)
+                    )
+                    group_scores[session_id] = group_stat
 
-                attempts = safe_int('attempts') + 1
-                correct_attempts = safe_int('correct_attempts')
-                current_score = safe_int('score')
-                correct_streak = safe_int('correct_streak')
-                max_correct_streak = safe_int('max_correct_streak')
-
-                if correct:
-                    correct_attempts += 1
-                    current_score += score
-                    correct_streak += 1
-                    max_correct_streak = max(max_correct_streak, correct_streak)
-                else:
-                    correct_streak = 0
-
-                group_scores_str = user_stats['group_scores'] if 'group_scores' in user_stats.keys() else '{}'
-                group_scores = json.loads(group_scores_str or '{}')
-                group_stat = group_scores.get(session_id, {"score": 0, "attempts": 0, "correct_attempts": 0})
-                if isinstance(group_stat, int):
-                    group_stat = {"score": group_stat, "attempts": 0, "correct_attempts": 0}
-
-                group_stat["score"] += score
-                group_stat["attempts"] += 1
-                if correct: group_stat["correct_attempts"] += 1
-                group_scores[session_id] = group_stat
-                
-                await cursor.execute("""
-                    UPDATE user_stats SET user_name=?, platform_name=?, score=?, attempts=?, correct_attempts=?,
-                                          correct_streak=?, max_correct_streak=?, group_scores=?
-                    WHERE user_id = ? AND platform_name = ?
-                """, (user_name, platform_name, current_score, attempts, correct_attempts,
-                      correct_streak, max_correct_streak, json.dumps(group_scores), user_id, platform_name))
+                    await cursor.execute(
+                        """
+                        UPDATE user_stats SET user_name = ?, platform_name = ?, score = ?, attempts = ?,
+                                              correct_attempts = ?, correct_streak = ?,
+                                              max_correct_streak = ?, group_scores = ?
+                        WHERE user_id = ? AND platform_name = ?
+                        """,
+                        (
+                            user_name,
+                            platform_name,
+                            current_score,
+                            attempts,
+                            correct_attempts,
+                            correct_streak,
+                            max_correct_streak,
+                            json.dumps(group_scores),
+                            user_id,
+                            platform_name,
+                        ),
+                    )
                 await conn.commit()
 
     async def consume_daily_play_attempt(
@@ -328,45 +337,56 @@ class DBService:
         session_id: str,
         is_independent: bool,
         platform_name: str = DEFAULT_PLATFORM_NAME,
-    ):
-        """根据是否为独立限制模式，消耗用户的每日游戏次数。"""
-        async with self._get_conn() as conn:
-            conn.row_factory = aiosqlite.Row
-            async with conn.cursor() as cursor:
-                await self._ensure_user_exists(cursor, user_id, user_name, platform_name)
-                today = datetime.now().strftime("%Y-%m-%d")
-
-                if is_independent:
+        daily_limit: int | None = None,
+    ) -> bool:
+        """原子检查并消耗每日次数，返回是否成功取得一次游戏资格。"""
+        async with self._write_lock:
+            async with self._get_conn() as conn:
+                conn.row_factory = aiosqlite.Row
+                async with conn.cursor() as cursor:
+                    await self._ensure_user_exists(cursor, user_id, user_name, platform_name)
+                    today = datetime.now().strftime("%Y-%m-%d")
                     await cursor.execute(
-                        "SELECT group_daily_plays FROM user_stats WHERE user_id = ? AND platform_name = ?",
+                        "SELECT daily_games_played, last_played_date, group_daily_plays "
+                        "FROM user_stats WHERE user_id = ? AND platform_name = ?",
                         (user_id, platform_name),
                     )
                     row = await cursor.fetchone()
-                    group_plays = json.loads(row['group_daily_plays'] or '{}')
-                    group_stat = group_plays.get(session_id, {})
 
-                    current_count = group_stat.get('count', 0) if group_stat.get('date') == today else 0
-                    group_plays[session_id] = {'count': current_count + 1, 'date': today}
-
-                    await cursor.execute(
-                        "UPDATE user_stats SET group_daily_plays = ?, user_name = ? "
-                        "WHERE user_id = ? AND platform_name = ?",
-                        (json.dumps(group_plays), user_name, user_id, platform_name),
-                    )
-                else:
-                    await cursor.execute(
-                        "SELECT daily_games_played, last_played_date FROM user_stats "
-                        "WHERE user_id = ? AND platform_name = ?",
-                        (user_id, platform_name),
-                    )
-                    row = await cursor.fetchone()
-                    daily_games = row['daily_games_played'] if row and row['last_played_date'] == today else 0
-                    await cursor.execute(
-                        "UPDATE user_stats SET daily_games_played = ?, last_played_date = ?, user_name = ? "
-                        "WHERE user_id = ? AND platform_name = ?",
-                        ((daily_games or 0) + 1, today, user_name, user_id, platform_name),
-                    )
+                    if is_independent:
+                        try:
+                            group_plays = json.loads(row["group_daily_plays"] or "{}")
+                        except (TypeError, json.JSONDecodeError):
+                            group_plays = {}
+                        group_stat = group_plays.get(session_id, {})
+                        current_count = (
+                            int(group_stat.get("count", 0) or 0)
+                            if group_stat.get("date") == today
+                            else 0
+                        )
+                        if daily_limit is not None and daily_limit >= 0 and current_count >= daily_limit:
+                            return False
+                        group_plays[session_id] = {"count": current_count + 1, "date": today}
+                        await cursor.execute(
+                            "UPDATE user_stats SET group_daily_plays = ?, user_name = ? "
+                            "WHERE user_id = ? AND platform_name = ?",
+                            (json.dumps(group_plays), user_name, user_id, platform_name),
+                        )
+                    else:
+                        current_count = (
+                            int(row["daily_games_played"] or 0)
+                            if row["last_played_date"] == today
+                            else 0
+                        )
+                        if daily_limit is not None and daily_limit >= 0 and current_count >= daily_limit:
+                            return False
+                        await cursor.execute(
+                            "UPDATE user_stats SET daily_games_played = ?, last_played_date = ?, user_name = ? "
+                            "WHERE user_id = ? AND platform_name = ?",
+                            (current_count + 1, today, user_name, user_id, platform_name),
+                        )
                 await conn.commit()
+                return True
 
     async def can_play(
         self,

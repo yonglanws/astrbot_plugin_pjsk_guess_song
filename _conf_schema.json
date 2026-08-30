@@ -42,6 +42,18 @@
     "default": [],
     "hint": "游戏结算消息末尾显示的快捷入口指令列表（如：猜歌、猜曲绘、猜卡面、歌词猜曲、Wordle）。若列表为空则不显示快捷入口。"
   },
+  "stats_server_url": {
+    "description": "在线统计服务器地址",
+    "type": "string",
+    "default": "",
+    "hint": "可选。在线统计服务的根地址，例如 https://stats.example.com；留空则使用旧版资源服务器兼容推导。"
+  },
+  "stats_server_api_key": {
+    "description": "在线统计 API 密钥",
+    "type": "string",
+    "default": "",
+    "hint": "可选。启用在线统计、分数同步和模式排名所需的 API 密钥。"
+  },
   "answer_timeout": {
     "description": "回答超时时间（秒）",
     "type": "int",

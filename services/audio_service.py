@@ -2,8 +2,8 @@ import asyncio
 import io
 import random
 import subprocess
-import time
 import itertools
+import uuid
 import aiohttp
 from typing import List, Dict, Optional, Tuple, Union
 from pathlib import Path
@@ -73,6 +73,10 @@ class AudioService:
             self._session = aiohttp.ClientSession()
         return self._session
 
+    def _output_path(self, prefix: str, suffix: str) -> Path:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        return self.output_dir / f"{prefix}_{uuid.uuid4().hex}{suffix}"
+
     async def get_game_clip(self, **kwargs) -> Optional[Dict]:
         if not self.cache_service.song_data or not PYDUB_AVAILABLE:
             logger.error("无法开始游戏: 歌曲数据未加载或pydub未安装。")
@@ -114,14 +118,14 @@ class AudioService:
                 start_range_min = int(song.get("fillerSec", 0) * 1000)
                 start_range_max = int(total_duration_ms - target_duration_ms)
                 start_ms = random.randint(start_range_min, start_range_max) if start_range_min < start_range_max else start_range_min
-                clip_path_obj = self.output_dir / f"clip_{int(time.time())}.mp3"
+                clip_path_obj = self._output_path("clip", ".mp3")
                 command = [
                     'ffmpeg', '-ss', str(start_ms / 1000.0), '-i', str(audio_source),
                     '-t', str(target_duration_ms / 1000.0), '-c', 'copy', '-y', str(clip_path_obj)
                 ]
                 run_subprocess = partial(subprocess.run, command, capture_output=True, text=True, check=True, encoding='utf-8')
                 await loop.run_in_executor(self.executor, run_subprocess)
-                mode_key = kwargs.get("random_mode_name") or "normal"
+                mode_key = kwargs.get("mode_key") or kwargs.get("random_mode_name") or "normal"
                 return {"song": song, "clip_path": str(clip_path_obj), "score": kwargs.get("score", 1), "mode": mode_key, "game_type": kwargs.get('game_type')}
             except Exception as e:
                 logger.warning(f"快速路径处理失败: {e}. 将回退到 pydub 慢速路径。")
@@ -144,9 +148,12 @@ class AudioService:
 
             clip = await loop.run_in_executor(self.executor, self._process_audio_with_pydub, audio_data, "mp3", pydub_kwargs)
             if clip is None: raise RuntimeError("pydub audio processing failed.")
-            mode = kwargs.get("random_mode_name") or "normal"
-            clip_path = self.output_dir / f"clip_{int(time.time())}.mp3"
-            clip.export(clip_path, format="mp3", bitrate="128k")
+            mode = kwargs.get("mode_key") or kwargs.get("random_mode_name") or "normal"
+            clip_path = self._output_path("clip", ".mp3")
+            await loop.run_in_executor(
+                self.executor,
+                partial(clip.export, clip_path, format="mp3", bitrate="128k"),
+            )
             return {"song": song, "clip_path": str(clip_path), "score": kwargs.get("score", 1), "mode": mode, "game_type": kwargs.get('game_type')}
         except Exception as e:
             logger.error(f"慢速路径 (pydub) 处理音频文件 {audio_source} 时失败: {e}", exc_info=True)
@@ -246,7 +253,7 @@ class AudioService:
             except Exception as e:
                 logger.error(f"处理歌曲封面失败: {option.get('title')}, 错误: {e}")
                 continue
-        img_path = self.output_dir / f"song_options_{int(time.time())}.png"
+        img_path = self._output_path("song_options", ".png")
         img.save(img_path)
         return str(img_path)
 
@@ -380,7 +387,7 @@ class AudioService:
                 footer_y = height - 25
                 pilmoji.text((center_x, footer_y), footer_text, font=id_font, fill=header_color, anchor="ms")
 
-            img_path = self.output_dir / f"song_ranking_{int(time.time())}.png"
+            img_path = self._output_path("song_ranking", ".png")
             img.save(img_path)
             return str(img_path)
         except Exception as e:
@@ -462,7 +469,7 @@ class AudioService:
                     current_y += y_increment
                 footer_text = f"GuessSong v{self.plugin_version}"
                 pilmoji.text((int(center_x), height - 40), footer_text, font=id_font, fill=header_color, anchor="ms")
-            img_path = self.output_dir / f"guess_song_help_{int(time.time())}.png"
+            img_path = self._output_path("guess_song_help", ".png")
             img.save(img_path)
             return str(img_path)
         except Exception as e:
@@ -663,7 +670,7 @@ class AudioService:
                 footer_text = f"GuessSong v{self.plugin_version} |"
                 pilmoji.text((center_x, height - 65), footer_text, font=font_footer, fill=c_dim, anchor="ms")
 
-            output_path = self.output_dir / f"personal_stats_{user_name}_{int(time.time())}.png"
+            output_path = self._output_path("personal_stats", ".png")
             img.save(output_path)
             return str(output_path)
 
