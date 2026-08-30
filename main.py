@@ -1098,6 +1098,15 @@ class GuessSongPlugin(Star):
         else:
             await event.send(event.plain_result("生成帮助图片时出错。"))
 
+    @filter.command("退出自动模式", alias={"退出", "退出自动猜歌", "停止自动猜歌"})
+    async def quit_auto_mode(self, event: AstrMessageEvent):
+        """退出自动猜歌模式（对局进行中时由对局等待器处理）"""
+        session_id = _get_normalized_session_id(event)
+        if session_id not in self.auto_game_sessions:
+            return
+        self.auto_game_sessions.pop(session_id, None)
+        await event.send(event.plain_result("已退出自动猜歌模式。"))
+
     @filter.command("猜歌切换国服题库", alias={"猜歌切换国服"})
     async def switch_to_sc(self, event: AstrMessageEvent):
         """切换为国服题库。"""
