@@ -70,7 +70,7 @@ class CustomSessionFilter(SessionFilter):
 PLUGIN_NAME = "pjsk_guess_song"
 PLUGIN_AUTHOR = "nichinichisou"
 PLUGIN_DESCRIPTION = "PJSK猜歌插件"
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.4.0"
 PLUGIN_REPO_URL = "https://github.com/nichinichisou0609/astrbot_plugin_pjsk_guess_song"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
@@ -753,6 +753,8 @@ class GuessSongPlugin(Star):
                 if in_auto_mode:
                     intro_md = intro_text + (
                         "\n"
+                        + self._build_connect_link(" ", official_self_id, show="点击回答")
+                        + "  "
                         + self._build_connect_link("退出本局", official_self_id)
                         + "  "
                         + self._build_connect_link("退出自动模式", official_self_id)
@@ -760,6 +762,8 @@ class GuessSongPlugin(Star):
                 else:
                     intro_md = intro_text + (
                         "\n"
+                        + self._build_connect_link(" ", official_self_id, show="点击回答")
+                        + "  "
                         + self._build_connect_link("退出本局", official_self_id)
                     )
                 await self._send_markdown_text(event, intro_md)
