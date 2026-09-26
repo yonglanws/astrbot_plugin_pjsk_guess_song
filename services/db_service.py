@@ -7,10 +7,12 @@ from astrbot.api import logger
 
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
+MAX_BINDINGS_PER_QQ = 2
 
 class DBService:
     DEFAULT_PLATFORM_NAME = DEFAULT_PLATFORM_NAME
     OFFICIAL_PLATFORM_NAME = OFFICIAL_PLATFORM_NAME
+    MAX_BINDINGS_PER_QQ = MAX_BINDINGS_PER_QQ
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -120,6 +122,17 @@ class DBService:
                 row = await cursor.fetchone()
         return str(row[0]) if row else str(user_id)
 
+    async def count_official_bindings_for_qq(self, qq_user_id: str) -> int:
+        """统计某个普通 QQ 号已绑定的官方账号数量（上限 MAX_BINDINGS_PER_QQ）。"""
+        async with self._get_conn() as conn:
+            async with conn.execute(
+                "SELECT COUNT(*) FROM account_bindings "
+                "WHERE official_platform = ? AND qq_user_id = ?",
+                (self.OFFICIAL_PLATFORM_NAME, str(qq_user_id).strip()),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
     @staticmethod
     def _merge_group_scores(target_value: str, source_value: str) -> str:
         try:
@@ -198,6 +211,16 @@ class DBService:
                         await conn.rollback()
                         return False
 
+                async with conn.execute(
+                    "SELECT COUNT(*) FROM account_bindings "
+                    "WHERE official_platform = ? AND qq_user_id = ?",
+                    (self.OFFICIAL_PLATFORM_NAME, target_id),
+                ) as cursor:
+                    (bound_count,) = await cursor.fetchone()
+                if int(bound_count or 0) >= self.MAX_BINDINGS_PER_QQ:
+                    await conn.rollback()
+                    return False
+
                 columns = "user_name, score, attempts, correct_attempts, last_played_date, " \
                           "daily_games_played, group_scores, group_daily_plays"
                 async with conn.execute(
@@ -254,6 +277,33 @@ class DBService:
             except Exception as exc:
                 await conn.rollback()
                 logger.error(f"绑定猜歌官方机器人账号失败: {exc}", exc_info=True)
+                return False
+
+    async def unbind_official_account(self, official_user_id: str) -> bool:
+        """解除官方账号的绑定关系（只删绑定行，已迁移合并的历史分数不回退）。"""
+        source_id = str(official_user_id).strip()
+        if not source_id:
+            return False
+
+        async with self._get_conn() as conn:
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+                async with conn.execute(
+                    "SELECT 1 FROM account_bindings WHERE official_platform = ? AND official_user_id = ?",
+                    (self.OFFICIAL_PLATFORM_NAME, source_id),
+                ) as cursor:
+                    if not await cursor.fetchone():
+                        await conn.rollback()
+                        return False
+                await conn.execute(
+                    "DELETE FROM account_bindings WHERE official_platform = ? AND official_user_id = ?",
+                    (self.OFFICIAL_PLATFORM_NAME, source_id),
+                )
+                await conn.commit()
+                return True
+            except Exception as exc:
+                await conn.rollback()
+                logger.error(f"解绑猜歌官方机器人账号失败: {exc}", exc_info=True)
                 return False
 
     async def update_stats(

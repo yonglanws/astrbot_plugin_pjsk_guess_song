@@ -17,13 +17,13 @@ from astrbot.api import AstrBotConfig
 
 # 导入重构后的服务
 try:
-    from .services.db_service import DBService
+    from .services.db_service import DBService, MAX_BINDINGS_PER_QQ
     from .services.audio_service import AudioService
     from .services.stats_service import StatsService
     from .services.cache_service import CacheService
     from .services.master_data_service import SERVER_JP, SERVER_SC, MasterDataService
 except ImportError:  # 直接以脚本方式加载（单测）时使用绝对导入
-    from services.db_service import DBService
+    from services.db_service import DBService, MAX_BINDINGS_PER_QQ
     from services.audio_service import AudioService
     from services.stats_service import StatsService
     from services.cache_service import CacheService
@@ -70,7 +70,7 @@ class CustomSessionFilter(SessionFilter):
 PLUGIN_NAME = "pjsk_guess_song"
 PLUGIN_AUTHOR = "nichinichisou"
 PLUGIN_DESCRIPTION = "PJSK猜歌插件"
-PLUGIN_VERSION = "1.2.2"
+PLUGIN_VERSION = "1.3.0"
 PLUGIN_REPO_URL = "https://github.com/nichinichisou0609/astrbot_plugin_pjsk_guess_song"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
@@ -273,7 +273,7 @@ class GuessSongPlugin(Star):
             self_id = self._get_official_connect_id(event)
             if self_id:
                 lines.append(self._build_connect_link(connect_switch_cmd, self_id))
-                account_links = ["猜歌绑定QQ", "猜歌个人分数", "猜歌排行榜"]
+                account_links = ["猜歌绑定QQ", "猜歌个人分数", "猜歌排行榜", "猜歌解绑QQ"]
                 lines.append(
                     "  ".join(self._build_connect_link(name, self_id) for name in account_links)
                 )
@@ -328,11 +328,14 @@ class GuessSongPlugin(Star):
         return raw_user_id, platform_name
 
     @staticmethod
-    def _build_binding_confirmation_message(qq_user_id: str) -> str:
-        return (
-            f"你确认将账号绑定至  {qq_user_id} ？官方机作答的分数将迁移至该账号。\n"
-            "发送“确认”将开始绑定。发送“取消”将取消绑定。"
-        )
+    def _build_binding_confirmation_message(qq_user_id: str, bound_count: int = 0) -> str:
+        lines = [f"你确认将账号绑定至  {qq_user_id} ？官方机作答的分数将迁移至该账号。"]
+        if bound_count == 1:
+            lines.append(
+                "你已经绑定过一个官机了，你只能绑定两个官机，请确认你是否要绑定此账号。"
+            )
+        lines.append("发送“确认”将开始绑定。发送“取消”将取消绑定。")
+        return "\n".join(lines)
 
     def _load_group_settings(self) -> Dict:
         """从 group_settings.json 加载群聊特定设置。"""
@@ -1139,7 +1142,12 @@ class GuessSongPlugin(Star):
             await event.send(event.plain_result(f"当前官方机器人账号已经绑定至 QQ号 {current_user_id}。"))
             return
 
-        await event.send(event.plain_result(self._build_binding_confirmation_message(qq_user_id)))
+        bound_count = await self.db_service.count_official_bindings_for_qq(qq_user_id)
+        if bound_count >= MAX_BINDINGS_PER_QQ:
+            await event.send(event.plain_result("绑定失败：该QQ号已绑定两个官机账号，无法继续绑定。"))
+            return
+
+        await event.send(event.plain_result(self._build_binding_confirmation_message(qq_user_id, bound_count)))
         decision = None
 
         @session_waiter(timeout=60)
@@ -1174,6 +1182,64 @@ class GuessSongPlugin(Star):
             await event.send(event.plain_result(f"绑定成功！官方机的历史分数已迁移至 QQ号 {qq_user_id}。"))
         else:
             await event.send(event.plain_result("绑定失败：该官方账号可能已绑定，请稍后重试。"))
+
+    @filter.command("猜歌解绑", alias={"pjsk猜歌解绑", "猜歌解绑QQ"})
+    async def unbind_song_account(self, event: AstrMessageEvent):
+        """解除 QQ 官方机器人账号与普通 QQ 账号的绑定。"""
+        if not self._is_qq_official_event(event):
+            await event.send(event.plain_result("此解绑功能仅支持 QQ 官方机器人使用。"))
+            return
+
+        official_user_id = str(event.get_sender_id())
+        current_user_id = await self.db_service.resolve_user_id(
+            OFFICIAL_PLATFORM_NAME,
+            official_user_id,
+        )
+        if str(current_user_id) == official_user_id:
+            await event.send(event.plain_result("当前官方机器人账号尚未绑定QQ号。"))
+            return
+
+        await event.send(
+            event.plain_result(
+                f"你确认解除该官方机器人账号与 QQ号 {current_user_id} 的绑定？"
+                "已迁移的历史分数不会退回，绑定名额将释放。\n"
+                "发送“确认”将开始解绑。发送“取消”将取消解绑。"
+            )
+        )
+        decision = None
+
+        @session_waiter(timeout=60)
+        async def unbinding_waiter(controller: SessionController, answer_event: AstrMessageEvent):
+            nonlocal decision
+            answer_text = answer_event.message_str.strip()
+            if answer_text == "确认":
+                decision = "confirm"
+                controller.stop()
+            elif answer_text == "取消":
+                decision = "cancel"
+                controller.stop()
+
+        try:
+            await unbinding_waiter(
+                event,
+                session_filter=BindingSessionFilter(event.unified_msg_origin, official_user_id),
+            )
+        except TimeoutError:
+            await event.send(event.plain_result("解绑确认已超时，解绑操作已取消。"))
+            return
+
+        if decision == "cancel":
+            await event.send(event.plain_result("已取消解绑。"))
+            return
+        if decision != "confirm":
+            await event.send(event.plain_result("未收到有效的解绑确认，解绑操作已取消。"))
+            return
+
+        unbound = await self.db_service.unbind_official_account(official_user_id)
+        if unbound:
+            await event.send(event.plain_result(f"解绑成功，该官方机器人账号已解除与 QQ号 {current_user_id} 的绑定。"))
+        else:
+            await event.send(event.plain_result("解绑失败，请稍后重试。"))
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_all_message_detect_quit(self, event: AstrMessageEvent):
