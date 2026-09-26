@@ -70,7 +70,7 @@ class CustomSessionFilter(SessionFilter):
 PLUGIN_NAME = "pjsk_guess_song"
 PLUGIN_AUTHOR = "nichinichisou"
 PLUGIN_DESCRIPTION = "PJSK猜歌插件"
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 PLUGIN_REPO_URL = "https://github.com/nichinichisou0609/astrbot_plugin_pjsk_guess_song"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
@@ -1124,7 +1124,16 @@ class GuessSongPlugin(Star):
         """切换为日服题库。"""
         await self._switch_server(event, SERVER_JP)
 
-    @filter.command("猜歌绑定", alias={"pjsk猜歌绑定", "猜歌绑定QQ"})
+    @filter.command(
+        "猜歌绑定",
+        alias={
+            "pjsk猜歌绑定",
+            "猜歌绑定QQ",
+            "猜歌绑定qq",
+            "pjsk猜歌绑定QQ",
+            "pjsk猜歌绑定qq",
+        },
+    )
     async def bind_song_account(self, event: AstrMessageEvent):
         """QQ 官方机器人账号绑定到普通 QQ 账号。"""
         if not self._is_qq_official_event(event):
@@ -1187,7 +1196,16 @@ class GuessSongPlugin(Star):
         else:
             await event.send(event.plain_result("绑定失败：该官方账号可能已绑定，请稍后重试。"))
 
-    @filter.command("猜歌解绑", alias={"pjsk猜歌解绑", "猜歌解绑QQ"})
+    @filter.command(
+        "猜歌解绑",
+        alias={
+            "pjsk猜歌解绑",
+            "猜歌解绑QQ",
+            "猜歌解绑qq",
+            "pjsk猜歌解绑QQ",
+            "pjsk猜歌解绑qq",
+        },
+    )
     async def unbind_song_account(self, event: AstrMessageEvent):
         """解除 QQ 官方机器人账号与普通 QQ 账号的绑定。"""
         if not self._is_qq_official_event(event):
